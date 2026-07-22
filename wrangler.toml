@@ -1,0 +1,8 @@
+name = "marin376-finanzas"
+main = "src/index.js"
+compatibility_date = "2026-07-21"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "marin376"
+database_id = "ab678acb-3f9d-4ed0-a013-4d280515369e"
