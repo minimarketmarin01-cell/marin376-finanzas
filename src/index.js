@@ -571,7 +571,7 @@ async function payloadFinanciero(env) {
     }
 
     if (!meses[ym]) {
-      meses[ym] = { tipos: {}, dias: {}, proveedores: {}, gastoCats: {}, nIngresos: 0, ingresoPOS: 0, ingresoTransferencia: 0, ingresoEfectivo: 0, ingresoOtro: 0, ingresoBanco: 0 };
+      meses[ym] = { tipos: {}, dias: {}, proveedores: {}, comprasPorProveedor: {}, gastoCats: {}, nIngresos: 0, ingresoPOS: 0, ingresoTransferencia: 0, ingresoEfectivo: 0, ingresoOtro: 0, ingresoBanco: 0 };
       TIPOS.forEach(t => meses[ym].tipos[t] = 0);
     }
     const M = meses[ym];
@@ -579,7 +579,7 @@ async function payloadFinanciero(env) {
     M.tipos[tipo] += monto;
     if (!M.dias[dia]) M.dias[dia] = { ingreso: 0, egreso: 0 };
     if (tipo === 'INGRESO') { M.dias[dia].ingreso += monto; M.nIngresos++; } else { M.dias[dia].egreso += monto; }
-    if (tipo === 'COSTOS') M.proveedores[cat] = (M.proveedores[cat] || 0) + monto;
+    if (tipo === 'COSTOS') { M.proveedores[cat] = (M.proveedores[cat] || 0) + monto; M.comprasPorProveedor[nombre] = (M.comprasPorProveedor[nombre] || 0) + monto; }
     if (tipo === 'GASTO OPE') M.gastoCats[cat] = (M.gastoCats[cat] || 0) + monto;
     if (tipo === 'INGRESO') {
       const catU = cat.toUpperCase();
@@ -653,7 +653,7 @@ async function payloadFinanciero(env) {
   const pctReserva = Number(config.pct_reserva) || 0;
 
   // --- Mix SKU/m² y venta por SKU (misma base D1 que Pedidos Marín 376) ---
-  let skuActivos = 0, ventaTotalYm = {}, ventaPorCategoriaYm = {};
+  let skuActivos = 0, ventaTotalYm = {}, ventaPorCategoriaYm = {}, ventaPorProveedorYm = {}, ventaPorSectorYm = {};
   try {
     const skuRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM productos").first();
     skuActivos = (skuRow && skuRow.n) || 0;
@@ -671,6 +671,32 @@ async function payloadFinanciero(env) {
     ventaCatRows.forEach(r => {
       if (!ventaPorCategoriaYm[r.ym]) ventaPorCategoriaYm[r.ym] = {};
       ventaPorCategoriaYm[r.ym][r.categoria] = r.venta;
+    });
+
+    // Venta por proveedor REAL (productos.proveedor_id → proveedores.nombre) — reemplaza el
+    // cruce por coincidencia de texto que usábamos antes de que Pedidos Marín separara los campos.
+    const ventaProvRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor, SUM(vdh.venta) AS venta
+       FROM ventas_diarias_historico vdh
+       JOIN productos p ON p.sku = vdh.sku
+       JOIN proveedores pr ON pr.id = p.proveedor_id
+       WHERE vdh.fecha >= ? GROUP BY ym, pr.nombre`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    ventaProvRows.forEach(r => {
+      if (!ventaPorProveedorYm[r.ym]) ventaPorProveedorYm[r.ym] = {};
+      ventaPorProveedorYm[r.ym][r.proveedor] = r.venta;
+    });
+
+    // Venta por sector (productos.sector) — informativo, no hay cruce de compras por sector
+    // porque las compras (cartola/SCQ) no quedan ligadas a un SKU específico.
+    const ventaSectorRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, p.sector AS sector, SUM(vdh.venta) AS venta
+       FROM ventas_diarias_historico vdh JOIN productos p ON p.sku = vdh.sku
+       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL GROUP BY ym, p.sector`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    ventaSectorRows.forEach(r => {
+      if (!ventaPorSectorYm[r.ym]) ventaPorSectorYm[r.ym] = {};
+      ventaPorSectorYm[r.ym][r.sector] = r.venta;
     });
   } catch (e) { /* si productos/ventas_diarias_historico aún no existen, seguimos sin esto */ }
 
@@ -708,9 +734,22 @@ async function payloadFinanciero(env) {
       const venta = (ventaPorCategoriaYm[ym] && ventaPorCategoriaYm[ym][cat]) || 0;
       rotacionCategoria[cat] = { compra, venta, margen: venta - compra };
     });
+
+    // Rotación por PROVEEDOR real (productos.proveedor_id) — reemplaza el cruce por texto de
+    // categoría, ahora que Pedidos Marín separó Proveedor y Sector como campos propios.
+    const rotacionProveedor = {};
+    const provsCompra = Object.keys(M.comprasPorProveedor || {});
+    const provsVenta = Object.keys(ventaPorProveedorYm[ym] || {});
+    Array.from(new Set([...provsCompra, ...provsVenta])).forEach(prov => {
+      const compra = (M.comprasPorProveedor && M.comprasPorProveedor[prov]) || 0;
+      const venta = (ventaPorProveedorYm[ym] && ventaPorProveedorYm[ym][prov]) || 0;
+      rotacionProveedor[prov] = { compra, venta, margen: venta - compra };
+    });
+
     salida.meses.push({
       ym, ingreso: ing, costos: cos, gastoOpe: gop, merma: mer, plasticos: pla,
       retiroUtilidad: retiroUtilidadMes, retiroPorSubtipo: retiroPorSubtipoYm[ym] || {},
+      ventaPorSector: ventaPorSectorYm[ym] || {}, rotacionProveedor,
       mermaDetalle: {
         real: (mermaPorYm[ym] && mermaPorYm[ym].real) || 0,
         nReal: (mermaPorYm[ym] && mermaPorYm[ym].nReal) || 0,
