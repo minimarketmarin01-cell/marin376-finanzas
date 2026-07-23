@@ -446,8 +446,11 @@ async function calcularQuiebreValorizado(env) {
               COALESCE(v.venta_prom_dia, 0) AS venta_prom_dia
        FROM productos p
        LEFT JOIN (
-         SELECT sku, AVG(venta) AS venta_prom_dia
-         FROM ventas_diarias_historico
+         SELECT sku, AVG(venta) AS venta_prom_dia FROM (
+           SELECT sku, venta FROM ventas_diarias
+           UNION ALL
+           SELECT sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+         )
          WHERE venta > 0
          GROUP BY sku
        ) v ON v.sku = p.sku
@@ -480,7 +483,11 @@ async function calcularCategoriasSinRotacion(env) {
       `SELECT p.categoria, COUNT(*) AS n_productos, SUM(p.stock * p.costo) AS capital_inmovilizado
        FROM productos p
        LEFT JOIN (
-         SELECT sku, SUM(venta) AS venta_total FROM ventas_diarias_historico GROUP BY sku
+         SELECT sku, SUM(venta) AS venta_total FROM (
+           SELECT sku, venta FROM ventas_diarias
+           UNION ALL
+           SELECT sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+         ) GROUP BY sku
        ) v ON v.sku = p.sku
        WHERE p.stock > 0 AND (v.venta_total IS NULL OR v.venta_total = 0)
        GROUP BY p.categoria
@@ -659,13 +666,21 @@ async function payloadFinanciero(env) {
     skuActivos = (skuRow && skuRow.n) || 0;
 
     const ventaTotalRows = (await env.DB.prepare(
-      `SELECT substr(fecha,1,7) AS ym, SUM(venta) AS venta FROM ventas_diarias_historico WHERE fecha >= ? GROUP BY ym`
+      `SELECT substr(fecha,1,7) AS ym, SUM(venta) AS venta FROM (
+         SELECT fecha, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) WHERE fecha >= ? GROUP BY ym`
     ).bind(FECHA_INICIO_FINANZAS).all()).results;
     ventaTotalRows.forEach(r => ventaTotalYm[r.ym] = r.venta);
 
     const ventaCatRows = (await env.DB.prepare(
       `SELECT substr(vdh.fecha,1,7) AS ym, p.categoria AS categoria, SUM(vdh.venta) AS venta
-       FROM ventas_diarias_historico vdh JOIN productos p ON p.sku = vdh.sku
+       FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh JOIN productos p ON p.sku = vdh.sku
        WHERE vdh.fecha >= ? GROUP BY ym, p.categoria`
     ).bind(FECHA_INICIO_FINANZAS).all()).results;
     ventaCatRows.forEach(r => {
@@ -677,7 +692,11 @@ async function payloadFinanciero(env) {
     // cruce por coincidencia de texto que usábamos antes de que Pedidos Marín separara los campos.
     const ventaProvRows = (await env.DB.prepare(
       `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor, SUM(vdh.venta) AS venta
-       FROM ventas_diarias_historico vdh
+       FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh
        JOIN productos p ON p.sku = vdh.sku
        JOIN proveedores pr ON pr.id = p.proveedor_id
        WHERE vdh.fecha >= ? GROUP BY ym, pr.nombre`
@@ -691,7 +710,11 @@ async function payloadFinanciero(env) {
     // porque las compras (cartola/SCQ) no quedan ligadas a un SKU específico.
     const ventaSectorRows = (await env.DB.prepare(
       `SELECT substr(vdh.fecha,1,7) AS ym, p.sector AS sector, SUM(vdh.venta) AS venta
-       FROM ventas_diarias_historico vdh JOIN productos p ON p.sku = vdh.sku
+       FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh JOIN productos p ON p.sku = vdh.sku
        WHERE vdh.fecha >= ? AND p.sector IS NOT NULL GROUP BY ym, p.sector`
     ).bind(FECHA_INICIO_FINANZAS).all()).results;
     ventaSectorRows.forEach(r => {
