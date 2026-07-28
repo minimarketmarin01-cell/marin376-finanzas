@@ -23,12 +23,30 @@ function chunkArray(arr, size) {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
+// D1 ejecuta env.DB.batch() como UNA transacción implícita: si un solo
+// statement falla, se revierte el chunk COMPLETO. Por eso un duplicado en
+// medio del lote hacía perder también las filas nuevas que lo acompañaban.
+// Ahora, si un chunk falla, se reintenta statement por statement para salvar
+// todo lo que sí es válido, y se reportan los que fallaron.
 async function batchRun(env, stmts, size = 400) {
   let changes = 0;
+  const fallidos = [];
   for (const chunk of chunkArray(stmts, size)) {
-    const results = await env.DB.batch(chunk);
-    results.forEach(r => { changes += (r.meta && r.meta.changes) || 0; });
+    try {
+      const results = await env.DB.batch(chunk);
+      results.forEach(r => { changes += (r.meta && r.meta.changes) || 0; });
+    } catch (e) {
+      for (const st of chunk) {
+        try {
+          const r = await st.run();
+          changes += (r.meta && r.meta.changes) || 0;
+        } catch (e2) {
+          fallidos.push(String(e2 && e2.message || e2));
+        }
+      }
+    }
   }
+  batchRun.ultimosFallidos = fallidos;
   return changes;
 }
 
@@ -219,48 +237,99 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
 async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
   const candidatos = [];
   let ignoradas = 0;
+  const motivosIgnoradas = { anuladas: 0, sin_monto: 0, sin_operacion: 0, sin_fecha: 0 };
+
   for (const f of filasCrudas) {
     const estado = String(f.estado || '').toUpperCase();
-    if (estado.indexOf('ANULAD') !== -1 || estado.indexOf('RECHAZ') !== -1) { ignoradas++; continue; }
+    if (estado.indexOf('ANULAD') !== -1 || estado.indexOf('RECHAZ') !== -1) { ignoradas++; motivosIgnoradas.anuladas++; continue; }
     const montoVenta = limpiarMontoFinanzas(f.montoVenta);
     const totalAbono = limpiarMontoFinanzas(f.totalAbono);
-    if (!montoVenta || montoVenta <= 0 || !f.nOperacion) { ignoradas++; continue; }
+    if (!f.nOperacion) { ignoradas++; motivosIgnoradas.sin_operacion++; continue; }
+    if (!montoVenta || montoVenta <= 0) { ignoradas++; motivosIgnoradas.sin_monto++; continue; }
+    // La fecha llega ya normalizada a YYYY-MM-DD desde el parser del front
+    // (que acepta DD-MM-YYYY). Se valida igual para que una fila con fecha
+    // corrupta no entre silenciosamente con ym vacío.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha || ''))) { ignoradas++; motivosIgnoradas.sin_fecha++; continue; }
     candidatos.push({
       fecha: f.fecha, nOperacion: f.nOperacion, montoVenta,
       comision: Math.max(0, montoVenta - totalAbono),
-      clave: 'SCQTX|' + f.nOperacion
+      clave: 'SCQTX|' + f.nOperacion,
+      nopVenta: 'SCQ-' + f.nOperacion + '-V',
+      nopComision: 'SCQ-' + f.nOperacion + '-C'
     });
   }
 
-  // Revisar duplicados en bloques de 100 (en vez de 1 consulta por transacción)
+  // ------------------------------------------------------------------
+  // CAUSA RAÍZ DEL UNIQUE: la deduplicación se hacía SOLO contra la tabla
+  // control_dedup, pero la restricción UNIQUE vive en registros.n_operacion.
+  // Son dos fuentes de verdad distintas: si una venta ya estaba en registros
+  // pero su clave no quedó en control_dedup (lote anterior abortado a mitad,
+  // carga por otra vía, o limpieza parcial), el filtro no la detectaba, el
+  // INSERT se ejecutaba igual y reventaba el UNIQUE.
+  // Ahora se consulta también la tabla real, que es la que impone el UNIQUE.
+  // ------------------------------------------------------------------
   const yaExisten = new Set();
+
   for (const bloque of chunkArray(candidatos, 100)) {
     if (!bloque.length) continue;
     const claves = bloque.map(c => c.clave);
-    const placeholders = claves.map(() => '?').join(',');
-    const rs = await env.DB.prepare(`SELECT clave FROM control_dedup WHERE clave IN (${placeholders})`).bind(...claves).all();
+    const ph = claves.map(() => '?').join(',');
+    const rs = await env.DB.prepare(`SELECT clave FROM control_dedup WHERE clave IN (${ph})`).bind(...claves).all();
     rs.results.forEach(r => yaExisten.add(r.clave));
   }
 
+  for (const bloque of chunkArray(candidatos, 100)) {
+    if (!bloque.length) continue;
+    const nops = bloque.map(c => c.nopVenta);
+    const ph = nops.map(() => '?').join(',');
+    const rs = await env.DB.prepare(`SELECT n_operacion FROM registros WHERE n_operacion IN (${ph})`).bind(...nops).all();
+    rs.results.forEach(r => {
+      const m = String(r.n_operacion || '').match(/^SCQ-(.+)-V$/);
+      if (m) yaExisten.add('SCQTX|' + m[1]);
+    });
+  }
+
   const nuevos = candidatos.filter(c => !yaExisten.has(c.clave));
-  const duplicadas = candidatos.length - nuevos.length;
+  const yaEstaban = candidatos.filter(c => yaExisten.has(c.clave));
+
+  // Rango de fechas y meses de un grupo, para que el resumen diga qué entró
+  // y qué no en vez de un error crudo.
+  const resumenGrupo = arr => {
+    if (!arr.length) return { n: 0, desde: null, hasta: null, meses: [] };
+    const fs = arr.map(c => c.fecha).sort();
+    const porMes = {};
+    fs.forEach(f => { const ym = f.slice(0, 7); porMes[ym] = (porMes[ym] || 0) + 1; });
+    return {
+      n: arr.length, desde: fs[0], hasta: fs[fs.length - 1],
+      meses: Object.keys(porMes).sort().map(ym => ({ ym, n: porMes[ym] }))
+    };
+  };
 
   const stmts = [];
   const conteoPorYm = {};
   for (const c of nuevos) {
+    // INSERT OR IGNORE: aunque quedara algún duplicado que las dos consultas
+    // anteriores no vieran (p. ej. carga simultánea), la fila se omite en
+    // silencio en vez de abortar el lote entero.
     stmts.push(env.DB.prepare(
-      `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-    ).bind('Venta tarjeta SCQ', c.fecha, 'VENTAS TARJETA', 'INGRESO', 'BANCO', c.montoVenta, 'SCQ-' + c.nOperacion + '-V', 'SCQ'));
+      `INSERT OR IGNORE INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
+    ).bind('Venta tarjeta SCQ', c.fecha, 'VENTAS TARJETA', 'INGRESO', 'BANCO', c.montoVenta, c.nopVenta, 'SCQ'));
     if (c.comision > 0) {
       stmts.push(env.DB.prepare(
-        `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-      ).bind('Comision SCQ', c.fecha, 'COMISION POS', 'GASTO OPE', 'BANCO', c.comision, 'SCQ-' + c.nOperacion + '-C', 'SCQ'));
+        `INSERT OR IGNORE INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
+      ).bind('Comision SCQ', c.fecha, 'COMISION POS', 'GASTO OPE', 'BANCO', c.comision, c.nopComision, 'SCQ'));
     }
     stmts.push(env.DB.prepare("INSERT OR IGNORE INTO control_dedup (clave) VALUES (?)").bind(c.clave));
     const ym = c.fecha.slice(0, 7);
     conteoPorYm[ym] = (conteoPorYm[ym] || 0) + 1;
   }
-  if (stmts.length) await batchRun(env, stmts, 100);
+
+  let filasEscritas = 0;
+  let erroresEscritura = [];
+  if (stmts.length) {
+    filasEscritas = await batchRun(env, stmts, 100);
+    erroresEscritura = batchRun.ultimosFallidos || [];
+  }
 
   const stmtsTx = Object.keys(conteoPorYm).map(ym =>
     env.DB.prepare(
@@ -270,7 +339,18 @@ async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
   );
   if (stmtsTx.length) await batchRun(env, stmtsTx, 100);
 
-  return { total_filas: filasCrudas.length, transacciones_escritas: nuevos.length, duplicadas_omitidas: duplicadas, ignoradas };
+  return {
+    total_filas: filasCrudas.length,
+    transacciones_escritas: nuevos.length,
+    duplicadas_omitidas: yaEstaban.length,
+    ignoradas,
+    motivos_ignoradas: motivosIgnoradas,
+    filas_db_escritas: filasEscritas,
+    errores_escritura: erroresEscritura,
+    nuevas: resumenGrupo(nuevos),
+    duplicadas: resumenGrupo(yaEstaban),
+    meses_detectados: Object.keys(conteoPorYm).sort()
+  };
 }
 
 async function financieroEditarFila(env, body) {
