@@ -129,6 +129,29 @@ const DICCIONARIO_FINANZAS = [
   ['MINIMARKET AZH',             'PRESTAMO', 'MINIMARKET AZH',   'Prestamo AZH'],
 ];
 
+// Normaliza nombres de proveedor para cruzarlos con la tabla `proveedores` de Pedidos Marín
+// (sin tildes/mayúsculas/puntuación) — mismo criterio que normalizarComparacion en ese Worker.
+function normNombreProveedor(s) {
+  return String(s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[.\-_,()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Proveedores REALES de Pedidos Marín (tabla `proveedores`, misma D1) — para que las compras
+// clasificadas acá por DICCIONARIO_FINANZAS usen el mismo nombre canónico que las ventas por
+// proveedor, y así "Rotación por proveedor" pueda cruzar compra vs. venta del mismo proveedor.
+async function cargarMapaProveedoresReales(env) {
+  const mapa = {};
+  try {
+    const r = await env.DB.prepare("SELECT nombre FROM proveedores").all();
+    (r.results || []).forEach(p => { mapa[normNombreProveedor(p.nombre)] = p.nombre; });
+  } catch (e) { /* tabla proveedores aún no disponible */ }
+  return mapa;
+}
+
 function limpiarMontoFinanzas(v) {
   const n = parseFloat(String(v || '0').replace(/\$/g, '').replace(/\./g, '').replace(/,/g, '.'));
   return isNaN(n) ? 0 : Math.round(n);
@@ -636,6 +659,7 @@ async function payloadFinanciero(env) {
   const meses = {};
   const filasTabla = [];
   const retiroPorSubtipoYm = {};
+  const mapaProveedoresReales = await cargarMapaProveedoresReales(env);
 
   for (const fila of filasDB) {
     const monto = Number(fila.monto) || 0;
@@ -666,7 +690,14 @@ async function payloadFinanciero(env) {
     M.tipos[tipo] += monto;
     if (!M.dias[dia]) M.dias[dia] = { ingreso: 0, egreso: 0 };
     if (tipo === 'INGRESO') { M.dias[dia].ingreso += monto; M.nIngresos++; } else { M.dias[dia].egreso += monto; }
-    if (tipo === 'COSTOS') { M.proveedores[cat] = (M.proveedores[cat] || 0) + monto; M.comprasPorProveedor[nombre] = (M.comprasPorProveedor[nombre] || 0) + monto; }
+    if (tipo === 'COSTOS') {
+      M.proveedores[cat] = (M.proveedores[cat] || 0) + monto;
+      // Usa el nombre canónico de Pedidos Marín cuando existe un proveedor real que
+      // coincide (normalizado); si no hay match, se agrupa por el nombre tal cual
+      // vino del diccionario de clasificación de la cartola.
+      const nombreProveedorReal = mapaProveedoresReales[normNombreProveedor(nombre)] || nombre;
+      M.comprasPorProveedor[nombreProveedorReal] = (M.comprasPorProveedor[nombreProveedorReal] || 0) + monto;
+    }
     if (tipo === 'GASTO OPE') M.gastoCats[cat] = (M.gastoCats[cat] || 0) + monto;
     if (tipo === 'INGRESO') {
       const catU = cat.toUpperCase();
