@@ -771,7 +771,7 @@ async function payloadFinanciero(env) {
   const pctReserva = Number(config.pct_reserva) || 0;
 
   // --- Mix SKU/m² y venta por SKU (misma base D1 que Pedidos Marín 376) ---
-  let skuActivos = 0, ventaTotalYm = {}, ventaPorCategoriaYm = {}, ventaPorProveedorYm = {}, ventaPorSectorYm = {}, margenPorSectorYm = {};
+  let skuActivos = 0, ventaTotalYm = {}, ventaPorCategoriaYm = {}, ventaPorProveedorYm = {}, ventaPorSectorYm = {}, margenPorSectorYm = {}, margenPorProveedorYm = {};
   try {
     const skuRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM productos").first();
     skuActivos = (skuRow && skuRow.n) || 0;
@@ -851,6 +851,27 @@ async function payloadFinanciero(env) {
       if (!margenPorSectorYm[r.ym]) margenPorSectorYm[r.ym] = {};
       margenPorSectorYm[r.ym][r.sector] = { venta: r.venta, utilidad: r.utilidad };
     });
+
+    // Margen real por proveedor (misma metodología Amorín que por sector, arriba): usa la
+    // utilidad real de Loyverse, no lo pagado en el mes — a diferencia de "Rotación por
+    // proveedor" (cash de la cartola), esto es inmune a compras grandes puntuales o meses sin
+    // cartola cargada para ese proveedor.
+    const margenProveedorRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor,
+              SUM(vdh.venta) AS venta, SUM(vdh.utilidad) AS utilidad
+       FROM (
+         SELECT fecha, sku, venta, utilidad FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta, utilidad FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh
+       JOIN productos p ON p.sku = vdh.sku
+       JOIN proveedores pr ON pr.id = p.proveedor_id
+       WHERE vdh.fecha >= ? GROUP BY ym, pr.nombre`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    margenProveedorRows.forEach(r => {
+      if (!margenPorProveedorYm[r.ym]) margenPorProveedorYm[r.ym] = {};
+      margenPorProveedorYm[r.ym][r.proveedor] = { venta: r.venta, utilidad: r.utilidad };
+    });
   } catch (e) { /* si productos/ventas_diarias_historico aún no existen, seguimos sin esto */ }
 
   const quiebreValorizado = await calcularQuiebreValorizado(env);
@@ -915,11 +936,29 @@ async function payloadFinanciero(env) {
       };
     });
 
+    // Margen global por proveedor (misma metodología Amorín, cortada por proveedor en vez de
+    // por sector) — su total puede diferir levemente del de arriba si hay productos con sector
+    // asignado pero sin proveedor_id, o viceversa.
+    const datosMargenProveedor = margenPorProveedorYm[ym] || {};
+    const ventaTotalConProveedor = Object.values(datosMargenProveedor).reduce((s, v) => s + v.venta, 0);
+    const utilidadTotalConProveedor = Object.values(datosMargenProveedor).reduce((s, v) => s + v.utilidad, 0);
+    const margenGlobalProveedorPct = ventaTotalConProveedor ? (utilidadTotalConProveedor / ventaTotalConProveedor * 100) : 0;
+    const margenPorProveedor = {};
+    Object.entries(datosMargenProveedor).forEach(([prov, v]) => {
+      margenPorProveedor[prov] = {
+        venta: v.venta,
+        utilidad: v.utilidad,
+        margenPct: v.venta ? (v.utilidad / v.venta * 100) : 0,
+        participacionPct: ventaTotalConProveedor ? (v.venta / ventaTotalConProveedor * 100) : 0
+      };
+    });
+
     salida.meses.push({
       ym, ingreso: ing, costos: cos, gastoOpe: gop, merma: mer, plasticos: pla,
       retiroUtilidad: retiroUtilidadMes, retiroPorSubtipo: retiroPorSubtipoYm[ym] || {},
       ventaPorSector: ventaPorSectorYm[ym] || {}, rotacionProveedor,
       margenGlobal: { pct: margenGlobalPct, ventaTotal: ventaTotalConSector, utilidadTotal: utilidadTotalConSector, porSector: margenPorSector },
+      margenGlobalProveedor: { pct: margenGlobalProveedorPct, ventaTotal: ventaTotalConProveedor, utilidadTotal: utilidadTotalConProveedor, porProveedor: margenPorProveedor },
       mermaDetalle: {
         real: (mermaPorYm[ym] && mermaPorYm[ym].real) || 0,
         nReal: (mermaPorYm[ym] && mermaPorYm[ym].nReal) || 0,
