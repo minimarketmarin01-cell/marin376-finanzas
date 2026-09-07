@@ -164,13 +164,23 @@ async function cargarDiccionarioAprendido(env) {
   } catch (e) { return []; }
 }
 
-function clasificarMovimientoEnMemoria(descripcion, aprendidos) {
+function clasificarMovimientoEnMemoria(descripcion, aprendidos, proveedoresReales) {
   const descU = String(descripcion || '').toUpperCase();
   for (const r of aprendidos) {
     if (descU.indexOf(String(r.patron).toUpperCase()) !== -1) return { tipo: r.tipo, categoria: r.categoria, nombre: r.nombre };
   }
   for (const [patron, tipo, categoria, nombre] of DICCIONARIO_FINANZAS) {
     if (descU.indexOf(patron) !== -1) return { tipo, categoria, nombre };
+  }
+  // Red de seguridad final: si el texto del banco menciona a un proveedor real de Pedidos
+  // Marín (tabla `proveedores`) que todavía no está en lo aprendido ni en el diccionario
+  // estático, se clasifica como COSTOS de ese proveedor en vez de mandarlo a Por revisar.
+  if (proveedoresReales) {
+    for (const nombreProv of proveedoresReales) {
+      if (nombreProv && descU.indexOf(String(nombreProv).toUpperCase()) !== -1) {
+        return { tipo: 'COSTOS', categoria: nombreProv, nombre: nombreProv };
+      }
+    }
   }
   return null;
 }
@@ -212,6 +222,7 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   const stmts = [];
   const clavesNuevas = new Set();
   const aprendidos = candCargo.length ? await cargarDiccionarioAprendido(env) : [];
+  const proveedoresReales = candCargo.length ? Object.values(await cargarMapaProveedoresReales(env)) : [];
 
   for (const f of candAbono) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
@@ -237,7 +248,7 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
 
   for (const f of candCargo) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
-    const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos);
+    const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos, proveedoresReales);
     if (match) {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
@@ -500,8 +511,9 @@ async function financieroLeerCierre(env, body) {
   catch (e) { return { ok: false, error: 'No se pudo interpretar la respuesta', crudo: texto }; }
 
   const aprendidos = await cargarDiccionarioAprendido(env);
+  const proveedoresReales = Object.values(await cargarMapaProveedoresReales(env));
   (extraido.costos_efectivo || []).forEach(cst => {
-    const m = clasificarMovimientoEnMemoria(String(cst.detalle || ''), aprendidos);
+    const m = clasificarMovimientoEnMemoria(String(cst.detalle || ''), aprendidos, proveedoresReales);
     if (m) { cst.categoria = m.categoria; cst.tipo = m.tipo; }
   });
 
@@ -512,6 +524,11 @@ async function financieroGuardarCierre(env, body) {
   const d = body.datos || {};
   const fecha = d.fecha;
   if (!fecha) return { ok: false, error: 'Falta la fecha' };
+  // El resto del sistema asume fecha ISO (payloadFinanciero filtra con WHERE fecha >= ? y
+  // agrupa por mes con fecha.slice(0,7)) — una fecha en otro formato queda guardada pero
+  // invisible en Registros y en los gráficos, sin ningún error. Mismo guard que ya usa
+  // ingestarAbonosSCQ para no aceptar una fecha corrupta en silencio.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fecha))) return { ok: false, error: 'Fecha inválida (se esperaba AAAA-MM-DD): ' + fecha };
   const stmts = [];
   let filas = 0;
 
@@ -1016,6 +1033,24 @@ export default {
       if (request.method === "GET") {
         if (action === "financiero" || action === "") {
           return json(await payloadFinanciero(env));
+        }
+        if (action === "migrar_fechas_cierre") {
+          // Migración de un solo uso: antes de este fix, financieroGuardarCierre no validaba
+          // el formato de fecha — algunos cierres quedaron guardados con "DD/MM/AAAA" en vez
+          // de ISO "AAAA-MM-DD", y payloadFinanciero (WHERE fecha >= ? + fecha.slice(0,7) por
+          // mes) los excluía en silencio de Registros y de los gráficos. Convierte esas filas
+          // a ISO; las que ya están bien no se tocan.
+          const filas = (await env.DB.prepare("SELECT id, fecha FROM registros WHERE origen = 'CIERRE_CAJA'").all()).results;
+          const corregidas = [];
+          for (const f of filas) {
+            if (/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha))) continue;
+            const m = String(f.fecha || '').trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+            if (!m) continue; // formato irreconocible — se deja para revisión manual, no se adivina
+            const iso = m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+            await env.DB.prepare("UPDATE registros SET fecha = ? WHERE id = ?").bind(iso, f.id).run();
+            corregidas.push({ id: f.id, de: f.fecha, a: iso });
+          }
+          return json({ ok: true, totalRevisadasCierreCaja: filas.length, corregidas });
         }
         return json({ ok: false, error: "Acción GET no reconocida: " + action }, 400);
       }
