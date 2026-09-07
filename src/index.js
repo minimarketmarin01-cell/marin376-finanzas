@@ -721,14 +721,23 @@ async function payloadFinanciero(env) {
     monto: Number(r.monto) || 0, motivo: r.motivo || '', archivo: r.archivo || ''
   }));
 
-  const setCats = new Set();
-  DICCIONARIO_FINANZAS.forEach(d => { if (d[2]) setCats.add(String(d[2]).toUpperCase().trim()); });
+  // Proveedores reales de Pedidos Marín (mapaProveedoresReales ya se cargó arriba, para el
+  // cruce de compras por proveedor) — para clasificar compras (COSTOS) por el proveedor real
+  // en vez de por el patrón de texto libre del diccionario de la cartola.
+  const proveedoresReales = Array.from(new Set(Object.values(mapaProveedoresReales)));
+
+  // Categorías de gasto operacional realmente creadas: aparecen en algún registro guardado, o
+  // fueron aprendidas al clasificar un movimiento como GASTO OPE. Se excluyen a propósito las
+  // categorías de COSTOS del diccionario estático (esas ya no se sugieren como categoría: para
+  // compras se sugiere el proveedor real, arriba).
+  const setCatsGastoOpe = new Set();
+  filasTabla.forEach(f => { if (f.tipo === 'GASTO OPE' && f.categoria) setCatsGastoOpe.add(String(f.categoria).toUpperCase().trim()); });
   try {
-    const aprendidos = await env.DB.prepare("SELECT categoria FROM diccionario_aprendido").all();
-    aprendidos.results.forEach(r => { if (r.categoria) setCats.add(String(r.categoria).toUpperCase().trim()); });
+    const aprendidosGasto = await env.DB.prepare("SELECT categoria FROM diccionario_aprendido WHERE tipo = 'GASTO OPE'").all();
+    aprendidosGasto.results.forEach(r => { if (r.categoria) setCatsGastoOpe.add(String(r.categoria).toUpperCase().trim()); });
   } catch (e) { /* tabla vacía, seguimos */ }
-  filasTabla.forEach(f => { if (f.categoria) setCats.add(String(f.categoria).toUpperCase().trim()); });
-  const categorias = Array.from(setCats).sort();
+
+  const categorias = Array.from(new Set([...proveedoresReales, ...setCatsGastoOpe])).sort();
 
   // --- Configuración (m², % distribución de utilidad) ---
   const cfgRows = (await env.DB.prepare("SELECT clave, valor FROM configuracion").all()).results;
