@@ -90,7 +90,7 @@ const DICCIONARIO_FINANZAS = [
   ['CONSORCIO INDUSTRIAL DE ALIME','COSTOS','CIAL',              'Cial'],
   ['VICEQUIM',                   'COSTOS', 'VICEQUIM',           'Vicequim'],
   ['COMERCIALIZADORA AGRICOLA JOS','COSTOS','AGRICOLA JOSE',     'Agricola Jose'],
-  ['SALINAS CONTRERAS',          'COSTOS', 'PALTA',              'Palta Salinas'],
+  ['SALINAS CONTRERAS',          'COSTOS', 'PALTA SALINAS',      'Palta Salinas'],
   ['SALAZAR ESCOBILLANA',        'COSTOS', 'PALTA',              'Palta Ricardo'],
   ['VASQUEZ HUENCHUAL',          'COSTOS', 'FRUTA',              'Fruta Vasquez'],
   ['DIAZ CEA CESAR',             'COSTOS', 'QUILTRATUE',         'Quiltratue'],
