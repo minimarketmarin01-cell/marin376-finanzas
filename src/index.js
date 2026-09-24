@@ -478,8 +478,8 @@ async function financieroLeerCierre(env, body) {
     'Si un número es ilegible, ponlo en 0 y no inventes. Devuelve solo el JSON.';
 
   const payload = {
-    model: 'claude-sonnet-5', // verificar en docs.claude.com si sigue siendo el modelo vigente con visión
-    max_tokens: 1024,
+    model: 'claude-sonnet-5',
+    max_tokens: 4096, // un cierre con muchas líneas de costos puede superar 1024 y cortar el JSON a la mitad
     messages: [{
       role: 'user',
       content: [
