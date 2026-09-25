@@ -709,10 +709,17 @@ async function payloadFinanciero(env) {
     if (tipo === 'INGRESO') { M.dias[dia].ingreso += monto; M.nIngresos++; } else { M.dias[dia].egreso += monto; }
     if (tipo === 'COSTOS') {
       M.proveedores[cat] = (M.proveedores[cat] || 0) + monto;
-      // Usa el nombre canónico de Pedidos Marín cuando existe un proveedor real que
-      // coincide (normalizado); si no hay match, se agrupa por el nombre tal cual
-      // vino del diccionario de clasificación de la cartola.
-      const nombreProveedorReal = mapaProveedoresReales[normNombreProveedor(nombre)] || nombre;
+      // La CATEGORÍA es la que de verdad guarda el proveedor real cuando se clasifica una
+      // compra (así se armó todo este panel: "DON ANDRÉS Y AMASADO", "SAN JORGE", "NESTLE",
+      // etc. son categorías, no el texto libre de `nombre` — que puede ser "Amasado", "Pan
+      // Marraqueta" o la descripción cruda del banco, distinta en cada fila del mismo
+      // proveedor). Antes se intentaba matchear por `nombre`, que casi nunca calzaba con un
+      // proveedor real de Pedidos Marín — la compra quedaba archivada bajo esa descripción
+      // suelta y "Rotación por proveedor" nunca la encontraba (mostraba compra $0 aunque
+      // había registros). Ahora se intenta por categoría primero (usando el nombre canónico
+      // si hay un proveedor real que normaliza igual), y solo si la categoría no calza con
+      // nada se usa `nombre` como último recurso.
+      const nombreProveedorReal = mapaProveedoresReales[normNombreProveedor(cat)] || cat || nombre;
       M.comprasPorProveedor[nombreProveedorReal] = (M.comprasPorProveedor[nombreProveedorReal] || 0) + monto;
     }
     if (tipo === 'GASTO OPE') M.gastoCats[cat] = (M.gastoCats[cat] || 0) + monto;
