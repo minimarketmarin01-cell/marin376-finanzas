@@ -51,7 +51,7 @@ async function batchRun(env, stmts, size = 400) {
 }
 
 const DICCIONARIO_FINANZAS = [
-  ['RUIZ Y GUZMAN',              'COSTOS', 'PANADERIA',          'Marraqueta'],
+  ['RUIZ Y GUZMAN',              'COSTOS', 'DON ANDRÉS Y AMASADO', 'Marraqueta'],
   ['COOPERATIVA AGRI',           'COSTOS', 'VAQUITA',            'Vaquita'],
   ['ALIMENTOS Y FRUTOS',         'COSTOS', 'MINUTO VERDE',       'Minuto Verde'],
   ['AGROCOMERCIAL CODIGUA',      'COSTOS', 'POSTRES',            'Codigua'],
