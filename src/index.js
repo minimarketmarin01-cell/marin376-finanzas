@@ -1093,23 +1093,35 @@ export default {
         if (action === "financiero" || action === "") {
           return json(await payloadFinanciero(env));
         }
+        if (action === "fechas_invalidas") {
+          // Filas que payloadFinanciero excluye en silencio (WHERE fecha >= ?) porque su
+          // `fecha` no está en formato ISO — sin esto, quedaban invisibles tanto en Registros
+          // como en todos los totales, sin ningún aviso.
+          const filas = (await env.DB.prepare(
+            "SELECT id, nombre, fecha, categoria, tipo, monto, n_operacion, origen FROM registros WHERE fecha NOT GLOB '20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]' ORDER BY fecha"
+          ).all()).results;
+          return json({ ok: true, filas });
+        }
         if (action === "migrar_fechas_cierre") {
-          // Migración de un solo uso: antes de este fix, financieroGuardarCierre no validaba
-          // el formato de fecha — algunos cierres quedaron guardados con "DD/MM/AAAA" en vez
-          // de ISO "AAAA-MM-DD", y payloadFinanciero (WHERE fecha >= ? + fecha.slice(0,7) por
-          // mes) los excluía en silencio de Registros y de los gráficos. Convierte esas filas
-          // a ISO; las que ya están bien no se tocan.
-          const filas = (await env.DB.prepare("SELECT id, fecha FROM registros WHERE origen = 'CIERRE_CAJA'").all()).results;
+          // Convierte a ISO cualquier fecha reconocible en cualquier registro (antes solo
+          // miraba origen='CIERRE_CAJA', pero el mismo problema de formato puede darse en
+          // cualquier origen). Reconoce año de 2 o 4 dígitos ("03/09/26" y "03/09/2026") —
+          // antes solo aceptaba 4 dígitos y dejaba pasar el resto como "irreconocible" aunque
+          // fuera perfectamente interpretable. Las que ya están en ISO no se tocan, y un
+          // formato que no calce con ninguno de los dos patrones se deja para revisión manual,
+          // no se adivina.
+          const filas = (await env.DB.prepare("SELECT id, fecha FROM registros").all()).results;
           const corregidas = [];
           for (const f of filas) {
             if (/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha))) continue;
-            const m = String(f.fecha || '').trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+            const m = String(f.fecha || '').trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
             if (!m) continue; // formato irreconocible — se deja para revisión manual, no se adivina
-            const iso = m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+            const anio = m[3].length === 2 ? '20' + m[3] : m[3];
+            const iso = anio + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
             await env.DB.prepare("UPDATE registros SET fecha = ? WHERE id = ?").bind(iso, f.id).run();
             corregidas.push({ id: f.id, de: f.fecha, a: iso });
           }
-          return json({ ok: true, totalRevisadasCierreCaja: filas.length, corregidas });
+          return json({ ok: true, totalRevisadas: filas.length, corregidas });
         }
         return json({ ok: false, error: "Acción GET no reconocida: " + action }, 400);
       }
