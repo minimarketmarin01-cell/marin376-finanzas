@@ -668,16 +668,82 @@ async function calcularVencimientosProximos(env) {
 async function payloadFinanciero(env) {
   const FECHA_INICIO_FINANZAS = '2026-07-01'; // Apps Script/Sheets quedó abandonado; arranca limpio desde julio 2026
 
-  const filasDB = (await env.DB.prepare(
-    "SELECT id, nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, subtipo_original FROM registros WHERE fecha >= ? ORDER BY fecha"
-  ).bind(FECHA_INICIO_FINANZAS).all()).results;
+  // Los totales mensuales (por tipo, por día, por categoría de gasto/costo, desglose de
+  // ingreso) se calculan con SUM()/GROUP BY en D1 en vez de sumarlos recorriendo cada fila acá.
+  // El tiempo que la Worker espera la respuesta de D1 no cuenta como CPU time (solo cuenta el
+  // cómputo que hace el propio JS) — por eso mover estas sumas a SQL reduce el uso real de CPU
+  // de la Worker, que es justo lo que el plan gratis de Cloudflare limita a 10ms por petición.
+  const [
+    filasDB,
+    tiposRows,
+    diasRows,
+    proveedoresRows,
+    gastoCatsRows,
+    ingresoRows,
+    retiroSubtipoRows
+  ] = await Promise.all([
+    env.DB.prepare(
+      "SELECT id, nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, subtipo_original FROM registros WHERE fecha >= ? ORDER BY fecha"
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+    env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym, tipo, SUM(monto) AS total
+       FROM registros WHERE fecha >= ? GROUP BY ym, tipo`
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+    env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym, substr(fecha,9,2) AS dia,
+              SUM(CASE WHEN tipo='INGRESO' THEN monto ELSE 0 END) AS ingreso,
+              SUM(CASE WHEN tipo='INGRESO' THEN 0 ELSE monto END) AS egreso,
+              SUM(CASE WHEN tipo='INGRESO' THEN 1 ELSE 0 END) AS n_ingresos
+       FROM registros WHERE fecha >= ? GROUP BY ym, dia`
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+    env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym, TRIM(categoria) AS categoria, SUM(monto) AS total
+       FROM registros WHERE fecha >= ? AND tipo='COSTOS' GROUP BY ym, categoria`
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+    env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym, TRIM(categoria) AS categoria, SUM(monto) AS total
+       FROM registros WHERE fecha >= ? AND tipo='GASTO OPE' GROUP BY ym, categoria`
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+    env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym,
+              SUM(CASE WHEN UPPER(categoria) LIKE '%TARJETA%' THEN monto ELSE 0 END) AS pos,
+              SUM(CASE WHEN UPPER(categoria) NOT LIKE '%TARJETA%' AND UPPER(categoria) LIKE '%TRANSFERENCIA%' THEN monto ELSE 0 END) AS transferencia,
+              SUM(CASE WHEN UPPER(categoria) NOT LIKE '%TARJETA%' AND UPPER(categoria) NOT LIKE '%TRANSFERENCIA%' AND cuenta='EFECTIVO' THEN monto ELSE 0 END) AS efectivo,
+              SUM(CASE WHEN UPPER(categoria) NOT LIKE '%TARJETA%' AND UPPER(categoria) NOT LIKE '%TRANSFERENCIA%' AND cuenta<>'EFECTIVO' THEN monto ELSE 0 END) AS otro,
+              SUM(CASE WHEN cuenta<>'EFECTIVO' THEN monto ELSE 0 END) AS banco
+       FROM registros WHERE fecha >= ? AND tipo='INGRESO' GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+    env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym, COALESCE(NULLIF(TRIM(subtipo_original),''),'OTRO') AS subtipo, SUM(monto) AS total
+       FROM registros WHERE fecha >= ? AND tipo='RETIRO_UTILIDAD' GROUP BY ym, subtipo`
+    ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+  ]);
 
-  const TIPOS = ['INGRESO','COSTOS','GASTO OPE','MERMA','PLASTICOS','RETIRO_UTILIDAD'];
   const meses = {};
   const filasTabla = [];
   const retiroPorSubtipoYm = {};
   const mapaProveedoresReales = await cargarMapaProveedoresReales(env);
 
+  const ensureYm = (ym) => {
+    if (!meses[ym]) {
+      meses[ym] = { tipos: {}, dias: {}, proveedores: {}, comprasPorProveedor: {}, gastoCats: {}, nIngresos: 0, ingresoPOS: 0, ingresoTransferencia: 0, ingresoEfectivo: 0, ingresoOtro: 0, ingresoBanco: 0 };
+    }
+    return meses[ym];
+  };
+
+  // Único recorrido en JS que queda: arma la tabla cruda para la UI (no hay forma de evitarlo,
+  // cada fila se muestra/edita individualmente) y calcula comprasPorProveedor, que necesita el
+  // mapa de normalización de nombres (mapaProveedoresReales) y por eso no es un SUM() directo.
+  //
+  // La CATEGORÍA es la que de verdad guarda el proveedor real cuando se clasifica una compra
+  // (así se armó todo este panel: "DON ANDRÉS Y AMASADO", "SAN JORGE", "NESTLE", etc. son
+  // categorías, no el texto libre de `nombre` — que puede ser "Amasado", "Pan Marraqueta" o la
+  // descripción cruda del banco, distinta en cada fila del mismo proveedor). Antes se intentaba
+  // matchear por `nombre`, que casi nunca calzaba con un proveedor real de Pedidos Marín — la
+  // compra quedaba archivada bajo esa descripción suelta y "Rotación por proveedor" nunca la
+  // encontraba (mostraba compra $0 aunque había registros). Ahora se intenta por categoría
+  // primero (usando el nombre canónico si hay un proveedor real que normaliza igual), y solo si
+  // la categoría no calza con nada se usa `nombre` como último recurso.
   for (const fila of filasDB) {
     const monto = Number(fila.monto) || 0;
     const tipo = String(fila.tipo || '').trim().toUpperCase();
@@ -687,51 +753,37 @@ async function payloadFinanciero(env) {
     const nop = String(fila.n_operacion || '').trim();
     const fecha = fila.fecha;
     const ym = fecha.slice(0, 7);
-    const dia = fecha.slice(8, 10);
     const subtipo = String(fila.subtipo_original || '').trim();
 
     filasTabla.push({ rowIndex: fila.id, nombre, fecha, categoria: cat, tipo, cuenta, monto, nop, ym, subtipo });
 
-    if (tipo === 'RETIRO_UTILIDAD') {
-      const clave = subtipo || 'OTRO';
-      if (!retiroPorSubtipoYm[ym]) retiroPorSubtipoYm[ym] = {};
-      retiroPorSubtipoYm[ym][clave] = (retiroPorSubtipoYm[ym][clave] || 0) + monto;
-    }
-
-    if (!meses[ym]) {
-      meses[ym] = { tipos: {}, dias: {}, proveedores: {}, comprasPorProveedor: {}, gastoCats: {}, nIngresos: 0, ingresoPOS: 0, ingresoTransferencia: 0, ingresoEfectivo: 0, ingresoOtro: 0, ingresoBanco: 0 };
-      TIPOS.forEach(t => meses[ym].tipos[t] = 0);
-    }
-    const M = meses[ym];
-    if (M.tipos[tipo] === undefined) M.tipos[tipo] = 0;
-    M.tipos[tipo] += monto;
-    if (!M.dias[dia]) M.dias[dia] = { ingreso: 0, egreso: 0 };
-    if (tipo === 'INGRESO') { M.dias[dia].ingreso += monto; M.nIngresos++; } else { M.dias[dia].egreso += monto; }
     if (tipo === 'COSTOS') {
-      M.proveedores[cat] = (M.proveedores[cat] || 0) + monto;
-      // La CATEGORÍA es la que de verdad guarda el proveedor real cuando se clasifica una
-      // compra (así se armó todo este panel: "DON ANDRÉS Y AMASADO", "SAN JORGE", "NESTLE",
-      // etc. son categorías, no el texto libre de `nombre` — que puede ser "Amasado", "Pan
-      // Marraqueta" o la descripción cruda del banco, distinta en cada fila del mismo
-      // proveedor). Antes se intentaba matchear por `nombre`, que casi nunca calzaba con un
-      // proveedor real de Pedidos Marín — la compra quedaba archivada bajo esa descripción
-      // suelta y "Rotación por proveedor" nunca la encontraba (mostraba compra $0 aunque
-      // había registros). Ahora se intenta por categoría primero (usando el nombre canónico
-      // si hay un proveedor real que normaliza igual), y solo si la categoría no calza con
-      // nada se usa `nombre` como último recurso.
       const nombreProveedorReal = mapaProveedoresReales[normNombreProveedor(cat)] || cat || nombre;
+      const M = ensureYm(ym);
       M.comprasPorProveedor[nombreProveedorReal] = (M.comprasPorProveedor[nombreProveedorReal] || 0) + monto;
     }
-    if (tipo === 'GASTO OPE') M.gastoCats[cat] = (M.gastoCats[cat] || 0) + monto;
-    if (tipo === 'INGRESO') {
-      const catU = cat.toUpperCase();
-      if (catU.indexOf('TARJETA') >= 0) M.ingresoPOS += monto;
-      else if (catU.indexOf('TRANSFERENCIA') >= 0) M.ingresoTransferencia += monto;
-      else if (cuenta === 'EFECTIVO') M.ingresoEfectivo += monto;
-      else M.ingresoOtro += monto;
-      if (cuenta !== 'EFECTIVO') M.ingresoBanco += monto;
-    }
   }
+
+  tiposRows.forEach(r => { ensureYm(r.ym).tipos[r.tipo] = Number(r.total) || 0; });
+  diasRows.forEach(r => {
+    const M = ensureYm(r.ym);
+    M.dias[r.dia] = { ingreso: Number(r.ingreso) || 0, egreso: Number(r.egreso) || 0 };
+    M.nIngresos += Number(r.n_ingresos) || 0;
+  });
+  proveedoresRows.forEach(r => { ensureYm(r.ym).proveedores[r.categoria] = Number(r.total) || 0; });
+  gastoCatsRows.forEach(r => { ensureYm(r.ym).gastoCats[r.categoria] = Number(r.total) || 0; });
+  ingresoRows.forEach(r => {
+    const M = ensureYm(r.ym);
+    M.ingresoPOS = Number(r.pos) || 0;
+    M.ingresoTransferencia = Number(r.transferencia) || 0;
+    M.ingresoEfectivo = Number(r.efectivo) || 0;
+    M.ingresoOtro = Number(r.otro) || 0;
+    M.ingresoBanco = Number(r.banco) || 0;
+  });
+  retiroSubtipoRows.forEach(r => {
+    if (!retiroPorSubtipoYm[r.ym]) retiroPorSubtipoYm[r.ym] = {};
+    retiroPorSubtipoYm[r.ym][r.subtipo] = Number(r.total) || 0;
+  });
 
   const conteoTxRows = (await env.DB.prepare("SELECT ym, n_transacciones FROM control_tx").all()).results;
   const conteoTx = {};
