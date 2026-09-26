@@ -666,7 +666,7 @@ async function calcularVencimientosProximos(env) {
 }
 
 async function payloadFinanciero(env) {
-  const FECHA_INICIO_FINANZAS = '2026-07-01'; // Apps Script/Sheets quedó abandonado; arranca limpio desde julio 2026
+  const FECHA_INICIO_FINANZAS = '2026-09-01'; // datos de abril/junio/julio/agosto se eliminaron de `registros`; arranca limpio desde septiembre 2026
 
   // Los totales mensuales (por tipo, por día, por categoría de gasto/costo, desglose de
   // ingreso) se calculan con SUM()/GROUP BY en D1 en vez de sumarlos recorriendo cada fila acá.
