@@ -1009,6 +1009,14 @@ async function payloadFinanciero(env) {
     const puntoEq = mc > 0 ? gop / mc : 0;
     const comisionPOS = M.gastoCats['COMISION POS'] || 0;
     const retiroUtilidadMes = M.tipos['RETIRO_UTILIDAD'] || 0;
+    // Distribución de utilidad (metodología Amorín): los 3 porcentajes son sobre el INGRESO
+    // del mes (igual que el resto de la tabla de indicadores: compras, RRHH, marketing, etc.,
+    // todos % de venta) — es cuánto RECOMIENDA destinar a cada cosa, no una forma de repartir
+    // lo que ya se retiró. Antes esto se calculaba sobre retiroUtilidadMes (lo ya retirado),
+    // que es una base completamente distinta y no tiene relación con la recomendación real.
+    const distRetiroSocios = Math.round(ing * pctRetiroSocios / 100);
+    const distInversion = Math.round(ing * pctInversion / 100);
+    const distReserva = Math.round(ing * pctReserva / 100);
     const ventaLoyverseMes = ventaTotalYm[ym] || 0;
     const rotacionCategoria = {};
     const catsCompra = Object.keys(M.proveedores || {});
@@ -1080,10 +1088,10 @@ async function payloadFinanciero(env) {
         tasaPerdida: ing ? (((mermaPorYm[ym] && mermaPorYm[ym].real) || 0) / ing * 100) : 0
       },
       distribucionUtilidad: {
-        total: retiroUtilidadMes,
-        retiroSocios: Math.round(retiroUtilidadMes * pctRetiroSocios / 100),
-        inversion: Math.round(retiroUtilidadMes * pctInversion / 100),
-        reserva: Math.round(retiroUtilidadMes * pctReserva / 100)
+        total: distRetiroSocios + distInversion + distReserva,
+        retiroSocios: distRetiroSocios,
+        inversion: distInversion,
+        reserva: distReserva
       },
       ventaLoyverseMes, ventaPorSku: skuActivos ? ventaLoyverseMes / skuActivos : 0,
       rotacionCategoria,
