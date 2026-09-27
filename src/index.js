@@ -152,6 +152,22 @@ async function cargarMapaProveedoresReales(env) {
   return mapa;
 }
 
+// Convierte a ISO ("AAAA-MM-DD") cualquier fecha reconocible (ISO ya, o "DD/MM/AAAA" /
+// "DD/MM/AA", con "/" o "-"). Devuelve null si el formato no se puede interpretar — nunca
+// adivina. payloadFinanciero excluye en silencio (WHERE fecha >= ?, comparación de texto)
+// cualquier fila cuya fecha no sea ISO, así que guardar una fecha no reconocida la vuelve
+// invisible en Registros y en todos los totales sin ningún aviso. Se usa acá (financiero
+// AgregarFila/EditarFila) para no dejar guardar algo así, y también en migrar_fechas_cierre
+// para corregir lo que ya haya quedado mal guardado antes de este fix.
+function normalizarFechaISO(fecha) {
+  const s = String(fecha || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
+  if (!m) return null;
+  const anio = m[3].length === 2 ? '20' + m[3] : m[3];
+  return anio + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+}
+
 function limpiarMontoFinanzas(v) {
   const n = parseFloat(String(v || '0').replace(/\$/g, '').replace(/\./g, '').replace(/,/g, '.'));
   return isNaN(n) ? 0 : Math.round(n);
@@ -393,7 +409,11 @@ async function financieroEditarFila(env, body) {
   const v = body.valores || {};
   const campos = [], valores = [];
   if (v.nombre !== undefined) { campos.push('nombre = ?'); valores.push(v.nombre); }
-  if (v.fecha !== undefined) { campos.push('fecha = ?'); valores.push(v.fecha); }
+  if (v.fecha !== undefined) {
+    const fechaIso = normalizarFechaISO(v.fecha);
+    if (fechaIso === null) return { ok: false, error: 'Fecha no reconocida: "' + v.fecha + '" (usa DD/MM/AAAA o AAAA-MM-DD)' };
+    campos.push('fecha = ?'); valores.push(fechaIso);
+  }
   if (v.categoria !== undefined) { campos.push('categoria = ?'); valores.push(v.categoria); }
   if (v.tipo !== undefined) { campos.push('tipo = ?'); valores.push(v.tipo); }
   if (v.cuenta !== undefined) { campos.push('cuenta = ?'); valores.push(v.cuenta); }
@@ -414,10 +434,15 @@ async function financieroEliminarFila(env, body) {
 
 async function financieroAgregarFila(env, body) {
   const v = body.valores || {};
+  // Vacío se permite (fila recién creada desde "+ Agregar registro", aún sin llenar); lo que
+  // NO se permite es un texto que parezca fecha pero no se pueda interpretar como tal — eso
+  // es justo lo que antes quedaba invisible en Registros y en todos los totales sin aviso.
+  const fechaIso = v.fecha ? normalizarFechaISO(v.fecha) : '';
+  if (v.fecha && fechaIso === null) return { ok: false, error: 'Fecha no reconocida: "' + v.fecha + '" (usa DD/MM/AAAA o AAAA-MM-DD)' };
   const nop = v.nop || ('MANUAL-' + Date.now());
   await env.DB.prepare(
     `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-  ).bind(v.nombre || '', v.fecha || '', v.categoria || '', v.tipo || '', v.cuenta || 'EFECTIVO', Number(v.monto) || 0, nop, 'MANUAL').run();
+  ).bind(v.nombre || '', fechaIso, v.categoria || '', v.tipo || '', v.cuenta || 'EFECTIVO', Number(v.monto) || 0, nop, 'MANUAL').run();
 
   // Si viene de aprobar un movimiento de Por revisar, aprende el patrón para
   // clasificar solo la próxima vez (igual que hacía Apps Script).
@@ -1114,10 +1139,8 @@ export default {
           const corregidas = [];
           for (const f of filas) {
             if (/^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha))) continue;
-            const m = String(f.fecha || '').trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
-            if (!m) continue; // formato irreconocible — se deja para revisión manual, no se adivina
-            const anio = m[3].length === 2 ? '20' + m[3] : m[3];
-            const iso = anio + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+            const iso = normalizarFechaISO(f.fecha);
+            if (iso === null) continue; // formato irreconocible — se deja para revisión manual, no se adivina
             await env.DB.prepare("UPDATE registros SET fecha = ? WHERE id = ?").bind(iso, f.id).run();
             corregidas.push({ id: f.id, de: f.fecha, a: iso });
           }
