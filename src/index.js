@@ -850,9 +850,25 @@ async function payloadFinanciero(env) {
   // --- Mermas y consumo interno (tabla `mermas`, compartida con Pedidos Marín 376) ---
   let mermaPorYm = {}, mermaCategoriaYm = {}, consumoCategoriaYm = {}, consumoResponsableYm = {};
   try {
+    // `mermas` la llena Pedidos Marín 376 con fecha en DD/MM/AAAA (no ISO como `registros`),
+    // y algunas filas viejas quedaron en formato "AAAA-MM-DD HH:MM:SS". Comparar/agrupar por
+    // `fecha` tal cual (como se hacía antes) compara texto, no fechas: "03/09/2026" es MENOR
+    // que "2026-09-01" en orden alfabético (empieza con '0'), así que absolutamente ninguna
+    // fila en DD/MM/AAAA pasaba el filtro `fecha >= ?` — la tarjeta de mermas se veía vacía
+    // aunque hubiera decenas de registros reales ese mes. Se normaliza primero a ISO real.
     const mermaRows = (await env.DB.prepare(
-      `SELECT substr(fecha,1,7) AS ym, motivo, categoria, responsable, SUM(costo_total) AS total, COUNT(*) AS n
-       FROM mermas WHERE fecha >= ? GROUP BY ym, motivo, categoria, responsable`
+      `WITH normalizado AS (
+         SELECT
+           CASE
+             WHEN fecha GLOB '[0-3][0-9]/[0-1][0-9]/[12][0-9][0-9][0-9]' THEN substr(fecha,7,4)||'-'||substr(fecha,4,2)||'-'||substr(fecha,1,2)
+             WHEN fecha GLOB '[12][0-9][0-9][0-9]-*' THEN substr(fecha,1,10)
+             ELSE NULL
+           END AS fecha_iso,
+           motivo, categoria, responsable, costo_total
+         FROM mermas
+       )
+       SELECT substr(fecha_iso,1,7) AS ym, motivo, categoria, responsable, SUM(costo_total) AS total, COUNT(*) AS n
+       FROM normalizado WHERE fecha_iso >= ? GROUP BY ym, motivo, categoria, responsable`
     ).bind(FECHA_INICIO_FINANZAS).all()).results;
     mermaRows.forEach(r => {
       if (!mermaPorYm[r.ym]) mermaPorYm[r.ym] = { real: 0, consumoInterno: 0, cambioProveedor: 0, nReal: 0 };
