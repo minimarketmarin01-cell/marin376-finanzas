@@ -1146,6 +1146,19 @@ async function payloadFinanciero(env) {
 
 
 
+// El token vive en la tabla `configuracion` de D1, NO en el código fuente (este repo es
+// público) ni en el frontend salvo como valor que el navegador debe enviar de vuelta —
+// eso solo frena bots/escaneos automáticos contra la URL del Worker, no a alguien que lea
+// el código fuente público del dashboard: ese vector requiere hacer los repos privados o
+// poner el Worker detrás de un login real (Cloudflare Access), no un token compartido.
+// Fail-closed a propósito: si la fila no existe (D1 recién creada, o se borró por error),
+// se deniega todo en vez de dejar el panel abierto en silencio como estaba antes.
+async function validarToken(env, tokenRecibido) {
+  const row = await env.DB.prepare("SELECT valor FROM configuracion WHERE clave = 'token_dashboard'").first();
+  const tokenValido = row && row.valor;
+  return !!tokenValido && tokenRecibido === tokenValido;
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
@@ -1154,6 +1167,13 @@ export default {
     const action = url.searchParams.get("action") || "";
 
     try {
+      const tokenRecibido = request.method === "GET"
+        ? url.searchParams.get("token")
+        : (await request.clone().json().catch(() => ({}))).token;
+      if (!(await validarToken(env, tokenRecibido))) {
+        return json({ ok: false, error: "No autorizado" }, 401);
+      }
+
       // ---------- GET: lectura del dashboard ----------
       if (request.method === "GET") {
         if (action === "financiero" || action === "") {
