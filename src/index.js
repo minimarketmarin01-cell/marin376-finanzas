@@ -1024,6 +1024,29 @@ async function payloadFinanciero(env) {
     });
   } catch (e) { /* si productos/ventas_diarias_historico aún no existen, seguimos sin esto */ }
 
+  // --- Fiados: venta a crédito (método de pago "otros" en Loyverse) y sus abonos ---
+  // Las llena Pedidos Marín 376 (marin376-api), que ya tiene el módulo completo: `fiados` es
+  // cada venta fiada (con SKUs reales, ya contada en ventas_diarias/"Ventas registradas" de
+  // arriba — no es venta aparte, solo no se cobró); `pagos_fiado` es cada abono/cobro real,
+  // con método de pago y cliente. El SKU_ABONO_FIADO ("Abono Fiado" en ventas_diarias, ya
+  // excluido arriba) es solo el mecanismo con que ese sistema cuadra la caja en Loyverse — esta
+  // tabla es la fuente estructurada real para el monto de abonos, más precisa que inferirlo del
+  // SKU ficticio.
+  let fiadoGeneradoYm = {}, abonosFiadoYm = {};
+  try {
+    const fiadoGeneradoRows = (await env.DB.prepare(
+      `SELECT substr(fecha_hora,1,7) AS ym, SUM(monto_total) AS total
+       FROM fiados WHERE fecha_hora >= ? GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    fiadoGeneradoRows.forEach(r => fiadoGeneradoYm[r.ym] = r.total || 0);
+
+    const abonosFiadoRows = (await env.DB.prepare(
+      `SELECT substr(fecha_hora,1,7) AS ym, SUM(monto) AS total
+       FROM pagos_fiado WHERE fecha_hora >= ? GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    abonosFiadoRows.forEach(r => abonosFiadoYm[r.ym] = r.total || 0);
+  } catch (e) { /* tablas de fiados aún no disponibles */ }
+
   const quiebreValorizado = await calcularQuiebreValorizado(env);
   const categoriasSinRotacion = await calcularCategoriasSinRotacion(env);
   const vencimientosProximos = await calcularVencimientosProximos(env);
@@ -1134,6 +1157,13 @@ async function payloadFinanciero(env) {
         reserva: distReserva
       },
       ventaLoyverseMes, ventaPorSku: skuActivos ? ventaLoyverseMes / skuActivos : 0,
+      // Ingreso efectivo = lo que de verdad entró: la venta ya excluye "Abono Fiado" (mecanismo
+      // de caja, no mercadería) pero SÍ incluye las ventas a crédito (fiadoGenerado) porque esas
+      // pasan por Loyverse con SKUs reales — hay que restarlas (no se cobraron) y sumar lo que
+      // sí se cobró de fiados anteriores (abonosFiado) para no perderlo ni contarlo dos veces.
+      fiadoGenerado: fiadoGeneradoYm[ym] || 0,
+      abonosFiado: abonosFiadoYm[ym] || 0,
+      ingresoEfectivoMes: ventaLoyverseMes - (fiadoGeneradoYm[ym] || 0) + (abonosFiadoYm[ym] || 0),
       rotacionCategoria,
       margenBruto, utilidad: util, rentabilidad: rent,
       efectivo, banco: M.ingresoBanco || 0, incompleto,
