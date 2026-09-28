@@ -693,6 +693,13 @@ async function calcularVencimientosProximos(env) {
 
 async function payloadFinanciero(env) {
   const FECHA_INICIO_FINANZAS = '2026-09-01'; // datos de abril/junio/julio/agosto se eliminaron de `registros`; arranca limpio desde septiembre 2026
+  // Artículos "de caja" que existen en Loyverse solo para cuadrar caja (ej. "Abono Fiado": el
+  // cliente paga una deuda ya vendida antes, y como Loyverse no tiene módulo de fiados, se
+  // registra como una "venta" de este artículo ficticio por el monto abonado) — no son ventas
+  // reales de mercadería y se excluyen de todo cálculo de venta/margen que cruce con `productos`.
+  // Costo $0 en `productos` además inflaba el margen de su sector/proveedor a un falso 100%.
+  const SKUS_NO_VENTA = ['10231']; // "Abono Fiado"
+  const FILTRO_SKU_NO_VENTA = SKUS_NO_VENTA.map(() => '?').join(',');
 
   // Los totales mensuales (por tipo, por día, por categoría de gasto/costo, desglose de
   // ingreso) se calculan con SUM()/GROUP BY en D1 en vez de sumarlos recorriendo cada fila acá.
@@ -921,11 +928,11 @@ async function payloadFinanciero(env) {
 
     const ventaTotalRows = (await env.DB.prepare(
       `SELECT substr(fecha,1,7) AS ym, SUM(venta) AS venta FROM (
-         SELECT fecha, venta FROM ventas_diarias
+         SELECT fecha, sku, venta FROM ventas_diarias
          UNION ALL
-         SELECT fecha, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) WHERE fecha >= ? GROUP BY ym`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) WHERE fecha >= ? AND sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
     ventaTotalRows.forEach(r => ventaTotalYm[r.ym] = r.venta);
 
     const ventaCatRows = (await env.DB.prepare(
@@ -935,8 +942,8 @@ async function payloadFinanciero(env) {
          UNION ALL
          SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
        ) vdh JOIN productos p ON p.sku = vdh.sku
-       WHERE vdh.fecha >= ? GROUP BY ym, p.categoria`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.categoria`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
     ventaCatRows.forEach(r => {
       if (!ventaPorCategoriaYm[r.ym]) ventaPorCategoriaYm[r.ym] = {};
       ventaPorCategoriaYm[r.ym][r.categoria] = r.venta;
@@ -953,8 +960,8 @@ async function payloadFinanciero(env) {
        ) vdh
        JOIN productos p ON p.sku = vdh.sku
        JOIN proveedores pr ON pr.id = p.proveedor_id
-       WHERE vdh.fecha >= ? GROUP BY ym, pr.nombre`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, pr.nombre`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
     ventaProvRows.forEach(r => {
       if (!ventaPorProveedorYm[r.ym]) ventaPorProveedorYm[r.ym] = {};
       ventaPorProveedorYm[r.ym][r.proveedor] = r.venta;
@@ -969,8 +976,8 @@ async function payloadFinanciero(env) {
          UNION ALL
          SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
        ) vdh JOIN productos p ON p.sku = vdh.sku
-       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL GROUP BY ym, p.sector`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.sector`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
     ventaSectorRows.forEach(r => {
       if (!ventaPorSectorYm[r.ym]) ventaPorSectorYm[r.ym] = {};
       ventaPorSectorYm[r.ym][r.sector] = r.venta;
@@ -988,8 +995,8 @@ async function payloadFinanciero(env) {
          UNION ALL
          SELECT fecha, sku, venta, utilidad FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
        ) vdh JOIN productos p ON p.sku = vdh.sku
-       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL GROUP BY ym, p.sector`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.sector`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
     margenSectorRows.forEach(r => {
       if (!margenPorSectorYm[r.ym]) margenPorSectorYm[r.ym] = {};
       margenPorSectorYm[r.ym][r.sector] = { venta: r.venta, utilidad: r.utilidad };
@@ -1009,8 +1016,8 @@ async function payloadFinanciero(env) {
        ) vdh
        JOIN productos p ON p.sku = vdh.sku
        JOIN proveedores pr ON pr.id = p.proveedor_id
-       WHERE vdh.fecha >= ? GROUP BY ym, pr.nombre`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, pr.nombre`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
     margenProveedorRows.forEach(r => {
       if (!margenPorProveedorYm[r.ym]) margenPorProveedorYm[r.ym] = {};
       margenPorProveedorYm[r.ym][r.proveedor] = { venta: r.venta, utilidad: r.utilidad };
