@@ -209,6 +209,18 @@ async function clasificarMovimientoFinanzas(env, descripcion) {
 async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   // Separar candidatos válidos (abono o cargo) sin tocar la DB todavía
   const candAbono = [], candCargo = [];
+  // BancoEstado (y probablemente otros) a veces le pone el MISMO "N° operación" a varias
+  // transferencias de un mismo lote (ej. transferencias masivas a proveedores el mismo día).
+  // Antes, como la clave de dedup era el nOperacion crudo, solo la PRIMERA fila de cada grupo
+  // se guardaba y el resto se descartaba en silencio como si ya existiera — se perdieron 12 de
+  // 13 filas de un mismo N° operación en producción. La clave ahora incluye fecha+monto+
+  // descripción además del nOperacion — así identifica cada fila por su CONTENIDO, no por su
+  // posición/orden dentro del archivo. Esto importa: una primera versión de este fix usaba un
+  // contador de ocurrencia por orden de aparición, pero el orden en que el parser del navegador
+  // entrega las filas no está garantizado que sea siempre el mismo entre una carga y una
+  // re-carga del mismo archivo — con eso, una fila ya insertada bajo la posición N podía
+  // reprocesarse bajo la posición M y duplicarse. Por contenido, la fecha+monto+descripción de
+  // cada fila es la misma sin importar el orden, así que la clave sigue siendo determinística.
   for (const f of filasCrudas) {
     const cargo = limpiarMontoFinanzas(f.cargo);
     const abono = limpiarMontoFinanzas(f.abono);
@@ -216,22 +228,62 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
     if (abono > 0) {
       if (descU.indexOf('RED GLOBAL') !== -1) continue; // esa plata llega por el reporte SCQ
       if (!f.nOperacion) continue;
-      candAbono.push({ ...f, abono, descU, clave: 'OP|' + f.nOperacion });
+      candAbono.push({ ...f, abono, descU, claveVieja: 'OP|' + f.nOperacion, clave: 'OP|' + f.nOperacion + '|' + f.fecha + '|' + abono + '|' + descU });
     } else {
       if (!cargo || cargo <= 0) continue;
       if (!f.nOperacion) continue;
-      candCargo.push({ ...f, cargo, clave: 'OP|' + f.nOperacion });
+      candCargo.push({ ...f, cargo, claveVieja: 'OP|' + f.nOperacion, clave: 'OP|' + f.nOperacion + '|' + f.fecha + '|' + cargo + '|' + descU });
     }
   }
 
+  // Cuántas filas de ESTE archivo comparten cada N° de operación — determina si se puede
+  // confiar en la claveVieja (formato anterior a este fix, solo el nOperacion crudo) para
+  // detectar duplicados de cargas ya hechas ANTES de este cambio: si el número es único en
+  // este archivo, la claveVieja identifica esa fila sin ambigüedad. Si se repite (el caso del
+  // bug), la claveVieja es la MISMA para las 13 filas y no permite saber cuál de ellas fue la
+  // que ya se había colado — para esas se usa solo la clave nueva (por contenido).
+  const conteoNop = {};
+  [...candAbono, ...candCargo].forEach(f => { conteoNop[f.nOperacion] = (conteoNop[f.nOperacion] || 0) + 1; });
+
   const todasClaves = [...candAbono, ...candCargo].map(c => c.clave);
+  const clavesViejasAConsultar = Array.from(new Set(
+    [...candAbono, ...candCargo].filter(f => conteoNop[f.nOperacion] === 1).map(f => f.claveVieja)
+  ));
   const yaExisten = new Set();
-  for (const bloque of chunkArray(todasClaves, 100)) {
+  for (const bloque of chunkArray([...todasClaves, ...clavesViejasAConsultar], 100)) {
     if (!bloque.length) continue;
     const placeholders = bloque.map(() => '?').join(',');
     const rs = await env.DB.prepare(`SELECT clave FROM control_dedup WHERE clave IN (${placeholders})`).bind(...bloque).all();
     rs.results.forEach(r => yaExisten.add(r.clave));
   }
+  // Si la claveVieja de una fila (nOperacion único en este archivo) ya estaba registrada por
+  // una carga anterior a este fix, se marca también la clave NUEVA como "ya existe" — es la que
+  // el resto del código consulta — para no reinsertar algo que ya se cargó antes.
+  [...candAbono, ...candCargo].forEach(f => {
+    if (conteoNop[f.nOperacion] === 1 && yaExisten.has(f.claveVieja)) yaExisten.add(f.clave);
+  });
+
+  // registros.n_operacion es UNIQUE, así que dos filas con el mismo N° de operación (mismo
+  // caso de arriba) no se pueden insertar tal cual — se les agrega un sufijo "-2", "-3"...
+  // verificado contra lo que ya exista en la tabla (por si una carga anterior ya usó ese mismo
+  // número, como pasaba antes de este fix con la primera fila de cada grupo repetido).
+  const nOpsDelArchivo = Array.from(new Set([...candAbono, ...candCargo].map(f => f.nOperacion)));
+  const nOpsOcupados = new Set();
+  for (const bloque of chunkArray(nOpsDelArchivo, 40)) {
+    if (!bloque.length) continue;
+    const condiciones = bloque.map(() => `n_operacion = ? OR n_operacion LIKE ?`).join(' OR ');
+    const binds = bloque.flatMap(b => [b, b + '-%']);
+    const rs = await env.DB.prepare(`SELECT n_operacion FROM registros WHERE ${condiciones}`).bind(...binds).all();
+    rs.results.forEach(r => nOpsOcupados.add(r.n_operacion));
+  }
+  const nOperacionUnico = base => {
+    if (!nOpsOcupados.has(base)) { nOpsOcupados.add(base); return base; }
+    let i = 2;
+    while (nOpsOcupados.has(base + '-' + i)) i++;
+    const candidato = base + '-' + i;
+    nOpsOcupados.add(candidato);
+    return candidato;
+  };
 
   let escritos = 0, revisar = 0;
   const duplicados = todasClaves.filter(c => yaExisten.has(c)).length;
@@ -242,20 +294,21 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
 
   for (const f of candAbono) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
+    const nOp = nOperacionUnico(f.nOperacion);
     if (f.descU.indexOf('DEVOLUCION DE IMPUESTO') !== -1) {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-      ).bind('Devolucion PPM', f.fecha, 'PPM F22', 'INGRESO', 'BANCO', f.abono, f.nOperacion, 'CARTOLA'));
+      ).bind('Devolucion PPM', f.fecha, 'PPM F22', 'INGRESO', 'BANCO', f.abono, nOp, 'CARTOLA'));
       escritos++;
     } else if (f.abono > 100000) {
       stmts.push(env.DB.prepare(
         `INSERT INTO por_revisar (fecha, n_operacion, descripcion, monto, motivo, archivo) VALUES (?,?,?,?,?,?)`
-      ).bind(f.fecha, f.nOperacion, f.descripcion, f.abono, 'Transferencia recibida > $100.000: confirmar si es venta', nombreArchivo));
+      ).bind(f.fecha, nOp, f.descripcion, f.abono, 'Transferencia recibida > $100.000: confirmar si es venta', nombreArchivo));
       revisar++;
     } else {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-      ).bind('Transferencia cliente', f.fecha, 'TRANSFERENCIA CLIENTES', 'INGRESO', 'BANCO', f.abono, f.nOperacion, 'CARTOLA'));
+      ).bind('Transferencia cliente', f.fecha, 'TRANSFERENCIA CLIENTES', 'INGRESO', 'BANCO', f.abono, nOp, 'CARTOLA'));
       escritos++;
     }
     stmts.push(env.DB.prepare("INSERT OR IGNORE INTO control_dedup (clave) VALUES (?)").bind(f.clave));
@@ -264,16 +317,17 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
 
   for (const f of candCargo) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
+    const nOp = nOperacionUnico(f.nOperacion);
     const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos, proveedoresReales);
     if (match) {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-      ).bind(match.nombre, f.fecha, match.categoria, match.tipo, 'BANCO', f.cargo, f.nOperacion, 'CARTOLA'));
+      ).bind(match.nombre, f.fecha, match.categoria, match.tipo, 'BANCO', f.cargo, nOp, 'CARTOLA'));
       escritos++;
     } else {
       stmts.push(env.DB.prepare(
         `INSERT INTO por_revisar (fecha, n_operacion, descripcion, monto, motivo, archivo) VALUES (?,?,?,?,?,?)`
-      ).bind(f.fecha, f.nOperacion, f.descripcion, f.cargo, 'Sin clasificar (cargo)', nombreArchivo));
+      ).bind(f.fecha, nOp, f.descripcion, f.cargo, 'Sin clasificar (cargo)', nombreArchivo));
       revisar++;
     }
     stmts.push(env.DB.prepare("INSERT OR IGNORE INTO control_dedup (clave) VALUES (?)").bind(f.clave));
