@@ -418,6 +418,7 @@ async function financieroEditarFila(env, body) {
   if (v.tipo !== undefined) { campos.push('tipo = ?'); valores.push(v.tipo); }
   if (v.cuenta !== undefined) { campos.push('cuenta = ?'); valores.push(v.cuenta); }
   if (v.monto !== undefined) { campos.push('monto = ?'); valores.push(Number(v.monto) || 0); }
+  if (v.subtipo !== undefined) { campos.push('subtipo_original = ?'); valores.push(v.subtipo); }
   if (!campos.length) return { ok: false, error: 'Nada que actualizar' };
   campos.push("actualizado_en = datetime('now')");
   valores.push(id);
@@ -441,8 +442,8 @@ async function financieroAgregarFila(env, body) {
   if (v.fecha && fechaIso === null) return { ok: false, error: 'Fecha no reconocida: "' + v.fecha + '" (usa DD/MM/AAAA o AAAA-MM-DD)' };
   const nop = v.nop || ('MANUAL-' + Date.now());
   await env.DB.prepare(
-    `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
-  ).bind(v.nombre || '', fechaIso, v.categoria || '', v.tipo || '', v.cuenta || 'EFECTIVO', Number(v.monto) || 0, nop, 'MANUAL').run();
+    `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen, subtipo_original) VALUES (?,?,?,?,?,?,?,?,?)`
+  ).bind(v.nombre || '', fechaIso, v.categoria || '', v.tipo || '', v.cuenta || 'EFECTIVO', Number(v.monto) || 0, nop, 'MANUAL', v.subtipo || '').run();
 
   // Si viene de aprobar un movimiento de Por revisar, aprende el patrón para
   // clasificar solo la próxima vez (igual que hacía Apps Script).
