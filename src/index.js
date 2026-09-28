@@ -849,6 +849,7 @@ async function payloadFinanciero(env) {
 
   // --- Mermas y consumo interno (tabla `mermas`, compartida con Pedidos Marín 376) ---
   let mermaPorYm = {}, mermaCategoriaYm = {}, consumoCategoriaYm = {}, consumoResponsableYm = {};
+  let mermasFilas = [];
   try {
     // `mermas` la llena Pedidos Marín 376 con fecha en DD/MM/AAAA (no ISO como `registros`),
     // y algunas filas viejas quedaron en formato "AAAA-MM-DD HH:MM:SS". Comparar/agrupar por
@@ -856,15 +857,14 @@ async function payloadFinanciero(env) {
     // que "2026-09-01" en orden alfabético (empieza con '0'), así que absolutamente ninguna
     // fila en DD/MM/AAAA pasaba el filtro `fecha >= ?` — la tarjeta de mermas se veía vacía
     // aunque hubiera decenas de registros reales ese mes. Se normaliza primero a ISO real.
+    const FECHA_ISO_MERMA = `CASE
+        WHEN fecha GLOB '[0-3][0-9]/[0-1][0-9]/[12][0-9][0-9][0-9]' THEN substr(fecha,7,4)||'-'||substr(fecha,4,2)||'-'||substr(fecha,1,2)
+        WHEN fecha GLOB '[12][0-9][0-9][0-9]-*' THEN substr(fecha,1,10)
+        ELSE NULL
+      END`;
     const mermaRows = (await env.DB.prepare(
       `WITH normalizado AS (
-         SELECT
-           CASE
-             WHEN fecha GLOB '[0-3][0-9]/[0-1][0-9]/[12][0-9][0-9][0-9]' THEN substr(fecha,7,4)||'-'||substr(fecha,4,2)||'-'||substr(fecha,1,2)
-             WHEN fecha GLOB '[12][0-9][0-9][0-9]-*' THEN substr(fecha,1,10)
-             ELSE NULL
-           END AS fecha_iso,
-           motivo, categoria, responsable, costo_total
+         SELECT ${FECHA_ISO_MERMA} AS fecha_iso, motivo, categoria, responsable, costo_total
          FROM mermas
        )
        SELECT substr(fecha_iso,1,7) AS ym, motivo, categoria, responsable, SUM(costo_total) AS total, COUNT(*) AS n
@@ -892,6 +892,22 @@ async function payloadFinanciero(env) {
         mermaCategoriaYm[r.ym][cat] = (mermaCategoriaYm[r.ym][cat] || 0) + (r.total || 0);
       }
     });
+
+    // Detalle a nivel de transacción individual (misma tabla, sin agrupar) — para el desglose
+    // expandible por categoría en el frontend (mismo patrón que `filas` para registros).
+    const mermasDetalleRows = (await env.DB.prepare(
+      `WITH normalizado AS (
+         SELECT id, ${FECHA_ISO_MERMA} AS fecha_iso, sku, producto, categoria, cantidad, costo_total, motivo, responsable
+         FROM mermas
+       )
+       SELECT id, fecha_iso, substr(fecha_iso,1,7) AS ym, sku, producto, categoria, cantidad, costo_total, motivo, responsable
+       FROM normalizado WHERE fecha_iso >= ? ORDER BY fecha_iso DESC`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    mermasFilas = mermasDetalleRows.map(r => ({
+      rowIndex: r.id, fecha: r.fecha_iso, ym: r.ym, sku: r.sku, producto: r.producto,
+      categoria: r.categoria || 'SIN CATEGORÍA', cantidad: r.cantidad, monto: r.costo_total,
+      motivo: String(r.motivo || '').toLowerCase(), responsable: r.responsable || ''
+    }));
   } catch (e) { /* tabla mermas aún no disponible */ }
   const pctRetiroSocios = Number(config.pct_retiro_socios) || 0;
   const pctInversion = Number(config.pct_inversion) || 0;
@@ -1006,7 +1022,7 @@ async function payloadFinanciero(env) {
   const vencimientosProximos = await calcularVencimientosProximos(env);
 
   const salida = {
-    generado: new Date().toISOString(), meses: [], filas: filasTabla, porRevisar, categorias,
+    generado: new Date().toISOString(), meses: [], filas: filasTabla, mermasFilas, porRevisar, categorias,
     skuActivos, areaVentasM2, mixSkuM2: areaVentasM2 ? skuActivos / areaVentasM2 : 0,
     pctRetiroSocios, pctInversion, pctReserva,
     quiebreValorizado, categoriasSinRotacion, vencimientosProximos
