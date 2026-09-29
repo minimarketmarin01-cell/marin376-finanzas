@@ -611,6 +611,7 @@ async function financieroGuardarCierre(env, body) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fecha))) return { ok: false, error: 'Fecha inválida (se esperaba AAAA-MM-DD): ' + fecha };
   const stmts = [];
   let filas = 0;
+  const abonosDeudaSueldo = [];
 
   if (Number(d.venta_efectivo) > 0) {
     stmts.push(env.DB.prepare(
@@ -632,9 +633,28 @@ async function financieroGuardarCierre(env, body) {
            ON CONFLICT(patron) DO UPDATE SET tipo=excluded.tipo, categoria=excluded.categoria, nombre=excluded.nombre`
         ).bind(String(cst.detalle).toUpperCase(), tipo, categoria, cst.detalle));
       }
+      // Un cierre de cuaderno con categoría "SUELDO DEUDA" es un abono a la deuda de sueldo de
+      // Rossy, además de un gasto normal acá — se espeja también como `payments` en la base
+      // aparte que calcula esa deuda (deuda-sueldo-rossy), bajo la categoría que ya agrupa este
+      // mismo origen ("Categoria 'SUELDO DEUDA' de la app de gastos del dueño").
+      if (String(categoria).toUpperCase() === 'SUELDO DEUDA') {
+        abonosDeudaSueldo.push({ fecha, monto: Number(cst.monto), nota: cst.detalle || 'Rossy' });
+      }
     }
   }
   if (stmts.length) await batchRun(env, stmts, 100);
+
+  if (abonosDeudaSueldo.length && env.DB_DEUDA_ROSSY) {
+    try {
+      const stmtsDeuda = abonosDeudaSueldo.map(a => env.DB_DEUDA_ROSSY.prepare(
+        `INSERT INTO payments (category_id, fecha, monto, nota) VALUES ('app_gastos_sep2026', ?, ?, ?)`
+      ).bind(a.fecha, a.monto, a.nota));
+      await env.DB_DEUDA_ROSSY.batch(stmtsDeuda);
+    } catch (e) {
+      // No se bloquea el cierre de caja si esto falla — solo se pierde el espejo en la otra
+      // base, que se puede reingresar a mano después.
+    }
+  }
   return { ok: true, filas };
 }
 

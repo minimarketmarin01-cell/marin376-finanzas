@@ -6,3 +6,8 @@ compatibility_date = "2026-07-21"
 binding = "DB"
 database_name = "marin376"
 database_id = "ab678acb-3f9d-4ed0-a013-4d280515369e"
+
+[[d1_databases]]
+binding = "DB_DEUDA_ROSSY"
+database_name = "deuda_sueldo_rossy"
+database_id = "03b54ed8-ac3a-4bc0-aae6-379b881ab68e"
