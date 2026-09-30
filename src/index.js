@@ -120,7 +120,7 @@ const DICCIONARIO_FINANZAS = [
   ['MATOS CHUMBES',              'GASTO OPE', 'PLASTICOS',       'Bolsas'],
   ['PAGO CW ENEL',               'GASTO OPE', 'SERVICIOS BÁSICOS', 'Enel'],
   ['ENEL',                       'GASTO OPE', 'SERVICIOS BÁSICOS', 'Enel'],
-  ['DIAZ MARTINEZ RAUL',         'GASTO OPE', 'IVA',             'Diaz Martinez'],
+  ['DIAZ MARTINEZ RAUL',         'IMPUESTOS', 'IVA',             'Diaz Martinez'],
   ['MINIMARKET E CL',            'GASTO OPE', 'ADMINISTRATIVO',  'Almuerzo personal'],
   ['VERA PEREDA',                'GASTO OPE', 'ARRIENDO',        'Arriendo'],
   ['SALAZAR REQUEJO EDWIN',      'GASTO OPE', 'ADMINISTRATIVO',  'Edwin'],
@@ -1136,10 +1136,16 @@ async function payloadFinanciero(env) {
     const M = meses[ym];
     const ing = M.tipos['INGRESO'] || 0, cos = M.tipos['COSTOS'] || 0, gop = M.tipos['GASTO OPE'] || 0;
     const mer = M.tipos['MERMA'] || 0, pla = M.tipos['PLASTICOS'] || 0;
+    // IMPUESTOS (ej. IVA) e INVERSION (ej. compra de activos/equipos) se separaron de GASTO OPE
+    // porque la metodología Amorín los trata como categorías aparte del 15% de gasto
+    // operacional (Impuestos ≤6%, Inversión ~1,5%) — mezclados ahí inflaban artificialmente el
+    // % de "Gasto ope." de la tarjeta de benchmark. Pero siguen siendo plata real que salió del
+    // negocio, así que SÍ deben restar de la utilidad/rentabilidad igual que antes.
+    const imp = M.tipos['IMPUESTOS'] || 0, inv = M.tipos['INVERSION'] || 0;
     // RETIRO_UTILIDAD (antes INSUMOS/ISABEL/PERSONAL) NO entra en egresos —
     // es retiro de utilidad, no gasto operativo. El detalle de quién retira
     // queda en subtipo_original (columna nueva tras la migración de TIPO).
-    const egresos = cos + gop + mer + pla, util = ing - egresos;
+    const egresos = cos + gop + mer + pla + imp + inv, util = ing - egresos;
     const margenBruto = ing ? (ing - cos) / ing * 100 : 0, rent = ing ? util / ing * 100 : 0;
     const efectivo = M.ingresoEfectivo || 0, incompleto = efectivo === 0;
     const mc = ing ? (ing - cos) / ing : 0;
@@ -1210,6 +1216,7 @@ async function payloadFinanciero(env) {
 
     salida.meses.push({
       ym, ingreso: ing, costos: cos, gastoOpe: gop, merma: mer, plasticos: pla,
+      impuestos: imp, inversion: inv,
       retiroUtilidad: retiroUtilidadMes, retiroPorSubtipo: retiroPorSubtipoYm[ym] || {},
       ventaPorSector: ventaPorSectorYm[ym] || {}, rotacionProveedor,
       margenGlobal: { pct: margenGlobalPct, ventaTotal: ventaTotalConSector, utilidadTotal: utilidadTotalConSector, porSector: margenPorSector },
