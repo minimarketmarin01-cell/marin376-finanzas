@@ -126,7 +126,7 @@ const DICCIONARIO_FINANZAS = [
   ['SALAZAR REQUEJO EDWIN',      'GASTO OPE', 'ADMINISTRATIVO',  'Edwin'],
   ['ROJAS REQUEJO ROS',          'GASTO OPE', 'SUELDO',          'Rossy'],
   ['CLINICA DENT',               'RETIRO_UTILIDAD', 'RETIRO SOCIO',     'Clinica Dental'],
-  ['MINIMARKET AZH',             'GASTO OPE', 'MINIMARKET AZH',   'Prestamo AZH'],
+  ['MINIMARKET AZH',             'PRESTAMO', 'MINIMARKET AZH',   'Prestamo AZH'],
 ];
 
 // Normaliza nombres de proveedor para cruzarlos con la tabla `proveedores` de Pedidos Marín
