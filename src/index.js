@@ -50,6 +50,39 @@ async function batchRun(env, stmts, size = 400) {
   return changes;
 }
 
+// Locales que atiende este mismo Worker. Cada uno tiene su propia D1 (registros, ventas,
+// catálogo); el request trae ?local= (GET) o body.local (POST) y el fetch() reemplaza env.DB
+// por la base de ese local antes de llamar a cualquier handler — por eso el resto del código
+// sigue usando env.DB sin saber de locales. La clave de acceso se valida siempre contra Marín.
+const LOCALES = {
+  marin: {
+    binding: 'DB',
+    nombre: 'Minimarket Marín',
+    fechaInicio: '2026-09-01', // abril-agosto se eliminaron de `registros`; arranca limpio desde septiembre 2026
+    skusNoVenta: ['10231'],    // "Abono Fiado"
+    diccionarioEstatico: true,
+    espejoDeudaRossy: true,
+    personalCierre: '"Isabel", "Sueldo/Rossy", ',
+    patronesPrestamoEntreLocales: [],
+  },
+  argomedo: {
+    binding: 'DB_ARGOMEDO',
+    nombre: 'Minimarket Argomedo 455',
+    fechaInicio: '2026-10-01',
+    skusNoVenta: ['12435'],    // "Abono Fiado" de Argomedo (config.fiados_sku_abono en su D1)
+    // Sin las reglas estáticas de Marín (arriendo, Rossy, AZH...): clasifica solo con lo
+    // aprendido + sus proveedores reales, y lo demás va a Por revisar.
+    diccionarioEstatico: false,
+    espejoDeudaRossy: false,
+    personalCierre: '',
+    // Minimarket AZH (Argomedo) recibe préstamos de Inversiones Salazar Requejo (Marín). Esa
+    // deuda ya se sigue desde Marín ("Dinero por cobrar" → MINIMARKET AZH); acá el abono no es
+    // ingreso, así que se registra como TRASPASO_INTERNO para no inflar las ventas.
+    patronesPrestamoEntreLocales: ['SALAZAR REQUEJO', '77493967', '77.493.967'],
+  },
+};
+const cfgLocal = env => LOCALES[env.LOCAL] || LOCALES.marin;
+
 const DICCIONARIO_FINANZAS = [
   ['RUIZ Y GUZMAN',              'COSTOS', 'DON ANDRÉS Y AMASADO', 'Marraqueta'],
   ['COOPERATIVA AGRI',           'COSTOS', 'VAQUITA',            'Vaquita'],
@@ -180,13 +213,15 @@ async function cargarDiccionarioAprendido(env) {
   } catch (e) { return []; }
 }
 
-function clasificarMovimientoEnMemoria(descripcion, aprendidos, proveedoresReales) {
+function clasificarMovimientoEnMemoria(descripcion, aprendidos, proveedoresReales, usarDiccionarioEstatico = true) {
   const descU = String(descripcion || '').toUpperCase();
   for (const r of aprendidos) {
     if (descU.indexOf(String(r.patron).toUpperCase()) !== -1) return { tipo: r.tipo, categoria: r.categoria, nombre: r.nombre };
   }
-  for (const [patron, tipo, categoria, nombre] of DICCIONARIO_FINANZAS) {
-    if (descU.indexOf(patron) !== -1) return { tipo, categoria, nombre };
+  if (usarDiccionarioEstatico) {
+    for (const [patron, tipo, categoria, nombre] of DICCIONARIO_FINANZAS) {
+      if (descU.indexOf(patron) !== -1) return { tipo, categoria, nombre };
+    }
   }
   // Red de seguridad final: si el texto del banco menciona a un proveedor real de Pedidos
   // Marín (tabla `proveedores`) que todavía no está en lo aprendido ni en el diccionario
@@ -203,7 +238,7 @@ function clasificarMovimientoEnMemoria(descripcion, aprendidos, proveedoresReale
 
 async function clasificarMovimientoFinanzas(env, descripcion) {
   const aprendidos = await cargarDiccionarioAprendido(env);
-  return clasificarMovimientoEnMemoria(descripcion, aprendidos);
+  return clasificarMovimientoEnMemoria(descripcion, aprendidos, null, cfgLocal(env).diccionarioEstatico);
 }
 
 async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
@@ -292,10 +327,16 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   const aprendidos = candCargo.length ? await cargarDiccionarioAprendido(env) : [];
   const proveedoresReales = candCargo.length ? Object.values(await cargarMapaProveedoresReales(env)) : [];
 
+  const patronesPrestamo = cfgLocal(env).patronesPrestamoEntreLocales;
   for (const f of candAbono) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
     const nOp = nOperacionUnico(f.nOperacion);
-    if (f.descU.indexOf('DEVOLUCION DE IMPUESTO') !== -1) {
+    if (patronesPrestamo.some(p => f.descU.indexOf(p) !== -1)) {
+      stmts.push(env.DB.prepare(
+        `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
+      ).bind(f.descripcion || 'Préstamo desde Marín 376', f.fecha, 'PRÉSTAMO DESDE MARÍN 376', 'TRASPASO_INTERNO', 'BANCO', f.abono, nOp, 'CARTOLA'));
+      escritos++;
+    } else if (f.descU.indexOf('DEVOLUCION DE IMPUESTO') !== -1) {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
       ).bind('Devolucion PPM', f.fecha, 'PPM F22', 'INGRESO', 'BANCO', f.abono, nOp, 'CARTOLA'));
@@ -318,7 +359,7 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   for (const f of candCargo) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
     const nOp = nOperacionUnico(f.nOperacion);
-    const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos, proveedoresReales);
+    const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos, proveedoresReales, cfgLocal(env).diccionarioEstatico);
     if (match) {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
@@ -526,10 +567,10 @@ async function financieroLeerCierre(env, body) {
   if (!body.imagenBase64) return { ok: false, error: 'No llegó la imagen' };
 
   const prompt =
-    'Esta es una foto de un cierre de caja MANUSCRITO de un minimarket chileno (Minimarket Marín). ' +
+    'Esta es una foto de un cierre de caja MANUSCRITO de un minimarket chileno (' + cfgLocal(env).nombre + '). ' +
     'El cuaderno normalmente tiene DOS tipos de líneas muy distintos:\n' +
-    '1) GASTOS REALES pagados en efectivo ese día (ej: nombre de proveedor, "Isabel", "Lavadora", ' +
-    '"Agua", "Sueldo/Rossy", "Boom", "Bolsas", pagos a personas o proveedores). Estos SÍ van en costos_efectivo.\n' +
+    '1) GASTOS REALES pagados en efectivo ese día (ej: nombre de proveedor, ' + cfgLocal(env).personalCierre + '"Lavadora", ' +
+    '"Agua", "Boom", "Bolsas", pagos a personas o proveedores). Estos SÍ van en costos_efectivo.\n' +
     '2) LÍNEAS DE RECONCILIACIÓN DE CAJA, que NO son gastos y debes EXCLUIR de costos_efectivo: ' +
     '"Caja apertura"/"Caja anterior" (saldo con que abrió la caja), "Efectivo" como TOTAL final de caja ' +
     '(no un gasto llamado "efectivo"), "Venta efectivo" (es un resultado, no un gasto), ' +
@@ -539,8 +580,10 @@ async function financieroLeerCierre(env, body) {
     'Para cada gasto real, sugiere también categoria y tipo usando EXACTAMENTE una de estas categorías ' +
     'conocidas del negocio (elige la más parecida por nombre/rubro; si ninguna calza bien usa categoria ' +
     '"OTROS EFECTIVO" y tipo "GASTO OPE"):\n' +
-    '- "Isabel" (persona) -> categoria "ISABEL", tipo "ISABEL" (línea de ensaladas)\n' +
-    '- "Rossy"/"Sueldo" -> categoria "SUELDO", tipo "GASTO OPE"\n' +
+    (cfgLocal(env).personalCierre
+      ? '- "Isabel" (persona) -> categoria "ISABEL", tipo "ISABEL" (línea de ensaladas)\n' +
+        '- "Rossy"/"Sueldo" -> categoria "SUELDO", tipo "GASTO OPE"\n'
+      : '- "Sueldo" -> categoria "SUELDO", tipo "GASTO OPE"\n') +
     '- "Bolsas"/plástico -> categoria "BOLSAS", tipo "PLASTICOS"\n' +
     '- Proveedores de fruta/verdura/abarrotes/panadería (ej. "Boom", "Vega", nombres propios de personas) -> tipo "COSTOS"\n' +
     '- Agua, luz, mantención, insumos de limpieza (ej. "Lavadora", "Amasado") -> tipo "GASTO OPE"\n\n' +
@@ -593,7 +636,7 @@ async function financieroLeerCierre(env, body) {
   const aprendidos = await cargarDiccionarioAprendido(env);
   const proveedoresReales = Object.values(await cargarMapaProveedoresReales(env));
   (extraido.costos_efectivo || []).forEach(cst => {
-    const m = clasificarMovimientoEnMemoria(String(cst.detalle || ''), aprendidos, proveedoresReales);
+    const m = clasificarMovimientoEnMemoria(String(cst.detalle || ''), aprendidos, proveedoresReales, cfgLocal(env).diccionarioEstatico);
     if (m) { cst.categoria = m.categoria; cst.tipo = m.tipo; }
   });
 
@@ -637,7 +680,7 @@ async function financieroGuardarCierre(env, body) {
       // Rossy, además de un gasto normal acá — se espeja también como `payments` en la base
       // aparte que calcula esa deuda (deuda-sueldo-rossy), bajo la categoría que ya agrupa este
       // mismo origen ("Categoria 'SUELDO DEUDA' de la app de gastos del dueño").
-      if (String(categoria).toUpperCase() === 'SUELDO DEUDA') {
+      if (cfgLocal(env).espejoDeudaRossy && String(categoria).toUpperCase() === 'SUELDO DEUDA') {
         abonosDeudaSueldo.push({ fecha, monto: Number(cst.monto), nota: cst.detalle || 'Rossy' });
       }
     }
@@ -766,13 +809,13 @@ async function calcularVencimientosProximos(env) {
 }
 
 async function payloadFinanciero(env) {
-  const FECHA_INICIO_FINANZAS = '2026-09-01'; // datos de abril/junio/julio/agosto se eliminaron de `registros`; arranca limpio desde septiembre 2026
+  const FECHA_INICIO_FINANZAS = cfgLocal(env).fechaInicio;
   // Artículos "de caja" que existen en Loyverse solo para cuadrar caja (ej. "Abono Fiado": el
   // cliente paga una deuda ya vendida antes, y como Loyverse no tiene módulo de fiados, se
   // registra como una "venta" de este artículo ficticio por el monto abonado) — no son ventas
   // reales de mercadería y se excluyen de todo cálculo de venta/margen que cruce con `productos`.
   // Costo $0 en `productos` además inflaba el margen de su sector/proveedor a un falso 100%.
-  const SKUS_NO_VENTA = ['10231']; // "Abono Fiado"
+  const SKUS_NO_VENTA = cfgLocal(env).skusNoVenta;
   const FILTRO_SKU_NO_VENTA = SKUS_NO_VENTA.map(() => '?').join(',');
 
   // Los totales mensuales (por tipo, por día, por categoría de gasto/costo, desglose de
@@ -1285,12 +1328,20 @@ export default {
     const action = url.searchParams.get("action") || "";
 
     try {
-      const tokenRecibido = request.method === "GET"
-        ? url.searchParams.get("token")
-        : (await request.clone().json().catch(() => ({}))).token;
+      const bodyPeek = request.method === "GET" ? null : await request.clone().json().catch(() => ({}));
+      const tokenRecibido = request.method === "GET" ? url.searchParams.get("token") : bodyPeek.token;
+      // La clave es una sola para todos los locales: se valida contra la base de Marín.
       if (!(await validarToken(env, tokenRecibido))) {
         return json({ ok: false, error: "No autorizado" }, 401);
       }
+
+      const local = (request.method === "GET" ? url.searchParams.get("local") : bodyPeek.local) || "marin";
+      if (!LOCALES[local]) return json({ ok: false, error: "Local desconocido: " + local }, 400);
+      const dbLocal = env[LOCALES[local].binding];
+      if (!dbLocal) return json({ ok: false, error: "Falta el binding " + LOCALES[local].binding + " en el Worker" }, 500);
+      // De acá en adelante todo usa la base del local elegido.
+      // Object.create hereda el resto de bindings/secretos sin depender de que sean enumerables.
+      env = Object.create(env, { DB: { value: dbLocal }, LOCAL: { value: local } });
 
       // ---------- GET: lectura del dashboard ----------
       if (request.method === "GET") {
