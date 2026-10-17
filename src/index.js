@@ -382,7 +382,19 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
 async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
   const candidatos = [];
   let ignoradas = 0;
-  const motivosIgnoradas = { anuladas: 0, sin_monto: 0, sin_operacion: 0, sin_fecha: 0 };
+  const motivosIgnoradas = { anuladas: 0, sin_monto: 0, sin_operacion: 0, sin_fecha: 0, reversadas: 0 };
+
+  // Una "Reversal Purchase" llega como fila aparte con Monto venta NEGATIVO y el
+  // MISMO N° de operación que la compra original (que queda en el reporte como
+  // "Pagado"). Antes la reversa se descartaba por monto <= 0 y la compra original
+  // entraba igual, contando dos veces una venta que el POS anuló y volvió a cobrar
+  // con otro N° de operación (caso real: 18/09/2026, $12.000, op 101832037655).
+  // Se juntan esas operaciones primero para no insertar la original y, si ya
+  // entró en una carga anterior, borrarla.
+  const opsReversadas = new Set();
+  for (const f of filasCrudas) {
+    if (f.nOperacion && limpiarMontoFinanzas(f.montoVenta) < 0) opsReversadas.add(String(f.nOperacion).trim());
+  }
 
   for (const f of filasCrudas) {
     const estado = String(f.estado || '').toUpperCase();
@@ -390,6 +402,7 @@ async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
     const montoVenta = limpiarMontoFinanzas(f.montoVenta);
     const totalAbono = limpiarMontoFinanzas(f.totalAbono);
     if (!f.nOperacion) { ignoradas++; motivosIgnoradas.sin_operacion++; continue; }
+    if (opsReversadas.has(String(f.nOperacion).trim())) { ignoradas++; motivosIgnoradas.reversadas++; continue; }
     if (!montoVenta || montoVenta <= 0) { ignoradas++; motivosIgnoradas.sin_monto++; continue; }
     // La fecha llega ya normalizada a YYYY-MM-DD desde el parser del front
     // (que acepta DD-MM-YYYY). Se valida igual para que una fila con fecha
@@ -469,6 +482,19 @@ async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
     conteoPorYm[ym] = (conteoPorYm[ym] || 0) + 1;
   }
 
+  // Compras reversadas que ya habían entrado en una carga anterior: se borran
+  // (venta + comisión + clave de dedup) y se descuentan del conteo de transacciones.
+  const reversasBorradas = [];
+  for (const op of opsReversadas) {
+    const ex = await env.DB.prepare("SELECT fecha, monto FROM registros WHERE n_operacion = ?").bind('SCQ-' + op + '-V').first();
+    if (!ex) continue;
+    stmts.push(env.DB.prepare("DELETE FROM registros WHERE n_operacion IN (?, ?)").bind('SCQ-' + op + '-V', 'SCQ-' + op + '-C'));
+    stmts.push(env.DB.prepare("DELETE FROM control_dedup WHERE clave = ?").bind('SCQTX|' + op));
+    const ym = String(ex.fecha).slice(0, 7);
+    conteoPorYm[ym] = (conteoPorYm[ym] || 0) - 1;
+    reversasBorradas.push({ n_operacion: op, fecha: ex.fecha, monto: ex.monto });
+  }
+
   let filasEscritas = 0;
   let erroresEscritura = [];
   if (stmts.length) {
@@ -476,7 +502,7 @@ async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
     erroresEscritura = batchRun.ultimosFallidos || [];
   }
 
-  const stmtsTx = Object.keys(conteoPorYm).map(ym =>
+  const stmtsTx = Object.keys(conteoPorYm).filter(ym => conteoPorYm[ym]).map(ym =>
     env.DB.prepare(
       `INSERT INTO control_tx (ym, n_transacciones) VALUES (?, ?)
        ON CONFLICT(ym) DO UPDATE SET n_transacciones = n_transacciones + ?`
@@ -488,13 +514,14 @@ async function ingestarAbonosSCQ(env, filasCrudas, nombreArchivo) {
     total_filas: filasCrudas.length,
     transacciones_escritas: nuevos.length,
     duplicadas_omitidas: yaEstaban.length,
+    reversas_borradas: reversasBorradas,
     ignoradas,
     motivos_ignoradas: motivosIgnoradas,
     filas_db_escritas: filasEscritas,
     errores_escritura: erroresEscritura,
     nuevas: resumenGrupo(nuevos),
     duplicadas: resumenGrupo(yaEstaban),
-    meses_detectados: Object.keys(conteoPorYm).sort()
+    meses_detectados: Object.keys(conteoPorYm).filter(ym => conteoPorYm[ym] > 0).sort()
   };
 }
 
