@@ -19,13 +19,15 @@ function d1(esquema) {
 }
 const marin = d1("esquema_marin_d1.sql"), argo = d1("esquema_argomedo_d1.sql");
 marin.sq.exec("INSERT INTO configuracion VALUES ('token_dashboard','tk')");
-const rossy = new DatabaseSync(":memory:"); rossy.exec("CREATE TABLE payments (id INTEGER PRIMARY KEY, category_id TEXT, fecha TEXT, monto REAL, nota TEXT)");
-const DB_DEUDA_ROSSY = { prepare: s => ({ bind: (...p) => ({ run: async () => rossy.prepare(s).run(...p) }) }), batch: async l => Promise.all(l.map(x => x.run())) };
+const rossyD1 = d1("esquema_rossy_d1.sql"), rossy = rossyD1.sq, DB_DEUDA_ROSSY = rossyD1.DB;
+rossy.exec("INSERT INTO categories VALUES ('app_gastos_sep2026','App de gastos','confirmado',1,'x',1); INSERT INTO payments(category_id,fecha,monto) VALUES ('app_gastos_sep2026','2026-09-30',1000)");
 
 const c = new Client(); await c.connect();
 await c.query("drop schema if exists marin376 cascade; drop schema if exists argomedo455 cascade");
 await c.query(fs.readFileSync("migracion/esquema_marin_pg.sql", "utf8"));
 await c.query(fs.readFileSync("migracion/esquema_argomedo_pg.sql", "utf8"));
+await c.query("drop schema if exists deuda_rossy cascade"); await c.query(fs.readFileSync("migracion/esquema_rossy_pg.sql", "utf8"));
+await c.query("INSERT INTO deuda_rossy.categories VALUES ('app_gastos_sep2026','App de gastos','confirmado',1,'x',1); INSERT INTO deuda_rossy.payments(id,category_id,fecha,monto,created_at) VALUES (1,'app_gastos_sep2026','2026-09-30',1000,'x')");
 await c.query(fs.readFileSync("migracion/funciones_espejo.sql", "utf8").replace(/revoke all[^;]*;|grant execute[^;]*;/g, ""));
 const llamadas = {};
 const srv = http.createServer(async (req, res) => {
@@ -59,7 +61,7 @@ for (const [local, base, esquema] of [["marin", marin, "marin376"], ["argomedo",
     ["ingesta_cartola_finanzas", { filas: cartola, archivo: "cartola.xlsx" }],
     ["ingesta_cartola_finanzas", { filas: cartola, archivo: "cartola.xlsx" }],    // repetir la misma cartola: nada nuevo
     ["financiero_agregar_fila", { valores: { nombre: "Arriendo", fecha: "16/10/2026", categoria: "ARRIENDO", tipo: "GASTO OPE", cuenta: "BANCO", monto: 300000 } }],
-    ["financiero_guardar_cierre", { datos: { fecha: "2026-10-17", venta_efectivo: 250000, costos_efectivo: [{ nombre: "Pan", categoria: "PAN", monto: 12000 }] } }]]) {
+    ["financiero_guardar_cierre", { datos: { fecha: "2026-10-17", venta_efectivo: 250000, costos_efectivo: [{ nombre: "Pan", categoria: "PAN", monto: 12000 }, { detalle: "Rossy", categoria: "SUELDO DEUDA", tipo: "GASTO OPE", monto: 50000 }] } }]]) {
     const j = await post(local, a, extra); assert(j.ok !== false, local + " " + a + ": " + JSON.stringify(j));
   }
   const id = base.sq.prepare("select id from registros where nombre='Arriendo'").get().id;
@@ -74,6 +76,10 @@ for (const [local, base, esquema] of [["marin", marin, "marin376"], ["argomedo",
   await igual(base, esquema, local);
   ok(local + ": cartola (2 veces), fila manual, editar, quitar de Por revisar, eliminar y cierre de caja → Supabase igual a D1, ids incluidos (" + nReg + " registros, " + nPr + " por revisar)");
 }
+const pagosD1 = rossy.prepare("select id, category_id, fecha, monto, nota from payments order by id").all().map(r => [r.id, r.category_id, r.fecha, r.monto, r.nota].join("|"));
+const pagosPg = (await c.query("select id, category_id, fecha, monto, nota from deuda_rossy.payments order by id")).rows.map(r => [r.id, r.category_id, r.fecha, r.monto, r.nota].join("|"));
+assert.deepStrictEqual(pagosPg, pagosD1); assert.strictEqual(pagosD1.length, 2, "solo Marín anota en Deuda Rossy");
+ok("el abono SUELDO DEUDA del cierre de Marín llegó también a Supabase (deuda_rossy), mismo id: " + pagosD1[1]);
 assert(llamadas.ejecutar_sql_espejo > 0 && llamadas.ejecutar_sql_espejo_argomedo > 0); ok("cada local va a su propia base en Supabase (" + JSON.stringify(llamadas) + ")");
 assert.strictEqual(Number((await c.query("select count(*) n from argomedo455.registros where nombre like 'Venta efectivo%'")).rows[0].n), 1);
 assert.strictEqual(Number((await c.query("select count(*) n from marin376.registros where nombre like 'Venta efectivo%'")).rows[0].n), 1); ok("lo de Argomedo no cae en Marín ni al revés");

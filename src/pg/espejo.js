@@ -5,8 +5,9 @@
 // - Las sentencias de cada petición se agrupan y se envían juntas (pocas llamadas HTTP). En Supabase cada una corre
 //   aislada: si una falla, las demás se guardan igual y la falla queda contada en el registro.
 // - Se apaga con el secreto/variable ESPEJO_SUPABASE = "0".
-// - Copia del espejo de marin376-cloudflare; aquí `rpc` elige la base de cada local en Supabase
-//   (ejecutar_sql_espejo -> esquema marin376, ejecutar_sql_espejo_argomedo -> esquema argomedo455).
+// - Copia del espejo de marin376-cloudflare; aquí `rpc` elige la base en Supabase (ejecutar_sql_espejo -> marin376,
+//   ejecutar_sql_espejo_argomedo -> argomedo455, ejecutar_sql_espejo_rossy -> deuda_rossy) y `tablasConId` sus
+//   tablas con id automático.
 import { traducirSql } from "./traductor.js";
 import { incrustar } from "./transporte_supabase.js";
 
@@ -19,10 +20,24 @@ const MAX_POR_ENVIO = 150;
 let _errores = 0, _enviadas = 0, _ultimoAviso = 0, _ultimoError = "";
 export function estadoEspejo() { return { enviadas: _enviadas, errores: _errores, ultimoError: _ultimoError }; }
 
+// Parámetros numerados de SQLite (?1, ?2, ?1 otra vez...) -> "?" en orden, repitiendo el valor donde haga falta.
+// Así el resto (agregar el id de D1, traducir a $1, $2...) trabaja siempre con "?" simples.
+export function normalizarNumerados(sql, params) {
+  if (!/\?\d/.test(sql)) return { sql, params };
+  const out = []; let txt = "", i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "'") { let j = i + 1; while (j < sql.length) { if (sql[j] === "'") { if (sql[j + 1] === "'") { j += 2; continue; } break; } j++; } txt += sql.slice(i, j + 1); i = j + 1; continue; }
+    if (ch === "?") { let j = i + 1; while (/\d/.test(sql[j] || "")) j++; const k = j > i + 1 ? parseInt(sql.slice(i + 1, j), 10) - 1 : out.length; out.push(params[k]); txt += "?"; i = j; continue; }
+    txt += ch; i++;
+  }
+  return { sql: txt, params: out };
+}
+
 // Agrega el id que asignó D1 a un INSERT de una sola fila en una tabla con id automático.
-export function conIdDeD1(sql, params, lastRowId) {
+export function conIdDeD1(sql, params, lastRowId, tablasConId = TABLAS_CON_ID) {
   const m = /^\s*INSERT\s+(?:OR\s+\w+\s+)?INTO\s+"?(\w+)"?\s*\(([^)]*)\)\s*VALUES\s*\(/i.exec(sql);
-  if (!m || !lastRowId || !TABLAS_CON_ID.has(m[1])) return null;
+  if (!m || !lastRowId || !tablasConId.has(m[1])) return null;
   const cols = m[2].split(",").map(c => c.trim().replace(/"/g, "").toLowerCase());
   if (cols.includes("id")) return null;
   const resto = sql.slice(m.index + m[0].length);
@@ -31,7 +46,7 @@ export function conIdDeD1(sql, params, lastRowId) {
   return { sql: sql.slice(0, m.index) + cabeza + "?, " + resto, params: [lastRowId, ...params] };
 }
 
-export function conEspejo(env, ctx, { rpc = "ejecutar_sql_espejo" } = {}) {
+export function conEspejo(env, ctx, { rpc = "ejecutar_sql_espejo", tablasConId = TABLAS_CON_ID } = {}) {
   if (!env || !env.DB || env.__espejo || env.__modo === "supabase") return env;
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || String(env.ESPEJO_SUPABASE || "1") === "0") return env;
   const d1 = env.DB;
@@ -41,8 +56,8 @@ export function conEspejo(env, ctx, { rpc = "ejecutar_sql_espejo" } = {}) {
   function encolar(sql, params, meta) {
     if (!ES_ESCRITURA.test(sql)) return;
     if (/^\s*INSERT/i.test(sql) && meta && meta.changes === 0) return;          // INSERT OR IGNORE que no insertó nada
-    let s = sql, p = params || [];
-    const ajustado = /^\s*INSERT/i.test(sql) && meta && meta.changes === 1 ? conIdDeD1(sql, p, meta.last_row_id) : null;
+    let { sql: s, params: p } = normalizarNumerados(sql, params || []);
+    const ajustado = /^\s*INSERT/i.test(s) && meta && meta.changes === 1 ? conIdDeD1(s, p, meta.last_row_id, tablasConId) : null;
     if (ajustado) { s = ajustado.sql; p = ajustado.params; }
     try {
       const { text } = traducirSql(s);
