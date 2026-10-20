@@ -6,6 +6,7 @@
 // ============================================================
 
 import { conEspejo } from "./pg/espejo.js";
+import { iniciarMedicion, resumenUso } from "./uso.js";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -1351,7 +1352,7 @@ async function validarToken(env, tokenRecibido) {
   return !!tokenValido && tokenRecibido === tokenValido;
 }
 
-export default {
+const _servidor = {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
@@ -1383,6 +1384,7 @@ export default {
 
       // ---------- GET: lectura del dashboard ----------
       if (request.method === "GET") {
+        if (action === "uso_diario") return json(await resumenUso(dbLocal)); // D1 cruda del local, sin espejo
         if (action === "financiero" || action === "") {
           return json(await payloadFinanciero(env));
         }
@@ -1456,5 +1458,19 @@ export default {
     } catch (err) {
       return json({ ok: false, error: err.message }, 500);
     }
+  }
+};
+
+// Mide las descargas pesadas (solo GET: ahí está el panel financiero) en la D1 del local elegido; no demora la respuesta.
+export default {
+  async fetch(request, env, ctx) {
+    const res = await _servidor.fetch(request, env, ctx);
+    try {
+      if (request.method === "GET") {
+        const local = new URL(request.url).searchParams.get("local") || "marin";
+        iniciarMedicion(request, res, ctx, LOCALES[local] && env[LOCALES[local].binding], "finanzas");
+      }
+    } catch (e) {}
+    return res;
   }
 };
