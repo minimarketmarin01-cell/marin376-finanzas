@@ -1376,7 +1376,10 @@ export default {
       // en la base del local. Sin los secretos SUPABASE_URL/SUPABASE_SERVICE_KEY queda la D1 tal cual.
       const dbConEspejo = conEspejo({ DB: dbLocal, SUPABASE_URL: env.SUPABASE_URL, SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY, ESPEJO_SUPABASE: env.ESPEJO_SUPABASE },
         ctx, { rpc: LOCALES[local].rpcEspejo }).DB;
-      env = Object.create(env, { DB: { value: dbConEspejo }, LOCAL: { value: local } });
+      // La base de Deuda Rossy (abonos de sueldo que anota el cierre de caja) también se copia, a su esquema deuda_rossy.
+      const dbRossyConEspejo = env.DB_DEUDA_ROSSY && conEspejo({ DB: env.DB_DEUDA_ROSSY, SUPABASE_URL: env.SUPABASE_URL, SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY, ESPEJO_SUPABASE: env.ESPEJO_SUPABASE },
+        ctx, { rpc: "ejecutar_sql_espejo_rossy", tablasConId: new Set(["payments"]) }).DB;
+      env = Object.create(env, { DB: { value: dbConEspejo }, LOCAL: { value: local }, ...(dbRossyConEspejo ? { DB_DEUDA_ROSSY: { value: dbRossyConEspejo } } : {}) });
 
       // ---------- GET: lectura del dashboard ----------
       if (request.method === "GET") {
