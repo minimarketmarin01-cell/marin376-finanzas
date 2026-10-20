@@ -5,6 +5,8 @@
 // ventas_diarias_historico, mermas — todas de solo lectura desde acá).
 // ============================================================
 
+import { conEspejo } from "./pg/espejo.js";
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -57,6 +59,7 @@ async function batchRun(env, stmts, size = 400) {
 const LOCALES = {
   marin: {
     binding: 'DB',
+    rpcEspejo: 'ejecutar_sql_espejo',           // copia en Supabase: esquema marin376
     nombre: 'Minimarket Marín',
     fechaInicio: '2026-09-01', // abril-agosto se eliminaron de `registros`; arranca limpio desde septiembre 2026
     skusNoVenta: ['10231'],    // "Abono Fiado"
@@ -67,6 +70,7 @@ const LOCALES = {
   },
   argomedo: {
     binding: 'DB_ARGOMEDO',
+    rpcEspejo: 'ejecutar_sql_espejo_argomedo',  // copia en Supabase: esquema argomedo455
     nombre: 'Minimarket Argomedo 455',
     fechaInicio: '2026-10-01',
     skusNoVenta: ['12435'],    // "Abono Fiado" de Argomedo (config.fiados_sku_abono en su D1)
@@ -1368,7 +1372,11 @@ export default {
       if (!dbLocal) return json({ ok: false, error: "Falta el binding " + LOCALES[local].binding + " en el Worker" }, 500);
       // De acá en adelante todo usa la base del local elegido.
       // Object.create hereda el resto de bindings/secretos sin depender de que sean enumerables.
-      env = Object.create(env, { DB: { value: dbLocal }, LOCAL: { value: local } });
+      // Cada escritura que D1 acepta se repite en Supabase en segundo plano (mismo espejo que las apps de Pedidos),
+      // en la base del local. Sin los secretos SUPABASE_URL/SUPABASE_SERVICE_KEY queda la D1 tal cual.
+      const dbConEspejo = conEspejo({ DB: dbLocal, SUPABASE_URL: env.SUPABASE_URL, SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY, ESPEJO_SUPABASE: env.ESPEJO_SUPABASE },
+        ctx, { rpc: LOCALES[local].rpcEspejo }).DB;
+      env = Object.create(env, { DB: { value: dbConEspejo }, LOCAL: { value: local } });
 
       // ---------- GET: lectura del dashboard ----------
       if (request.method === "GET") {
