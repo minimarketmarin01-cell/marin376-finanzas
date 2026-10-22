@@ -83,7 +83,10 @@ const LOCALES = {
     // Minimarket AZH (Argomedo) recibe préstamos de Inversiones Salazar Requejo (Marín). Esa
     // deuda ya se sigue desde Marín ("Dinero por cobrar" → MINIMARKET AZH); acá el abono no es
     // ingreso, así que se registra como TRASPASO_INTERNO para no inflar las ventas.
-    patronesPrestamoEntreLocales: ['SALAZAR REQUEJO', '77493967', '77.493.967'],
+    // BancoEstado corta el nombre del ordenante en la cartola ("TEF BANCOESTADO DE INVERSIONES
+    // SALA"), por eso también se busca el prefijo. Solo se aplica a ABONOS (ver
+    // ingestarCartolaDesdeFilas): los cargos a "SALAZAR REQUEJO E…" no pasan por esta regla.
+    patronesPrestamoEntreLocales: ['SALAZAR REQUEJO', 'INVERSIONES SALA', '77493967', '77.493.967'],
   },
 };
 const cfgLocal = env => LOCALES[env.LOCAL] || LOCALES.marin;
