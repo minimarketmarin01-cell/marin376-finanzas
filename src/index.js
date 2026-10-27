@@ -221,10 +221,26 @@ async function cargarDiccionarioAprendido(env) {
   } catch (e) { return []; }
 }
 
-function clasificarMovimientoEnMemoria(descripcion, aprendidos, proveedoresReales, usarDiccionarioEstatico = true) {
+// Una regla aprendida de UNA sola palabra ("PAN", "AGUA", "TRANSPORTE") se busca como palabra
+// completa: sin esto, "PAN" calzaba dentro de "COMPANIA" y mandaba a PANADERIA los pagos a
+// "COMERCIAL ARCAYA Y COMPANIA" (y "AGUA" dentro de "AGUAS ANDINAS"). Las reglas de varias
+// palabras siguen buscándose como texto corrido, porque el banco corta los nombres a mitad de
+// palabra ("TEF A COMERCIAL SANTA EL").
+function calzaReglaAprendida(descU, patron, palabraCompleta) {
+  const p = String(patron).toUpperCase();
+  if (descU.indexOf(p) === -1) return false;
+  if (!palabraCompleta || /\s/.test(p)) return true;
+  const letra = 'A-Z0-9ÁÉÍÓÚÜÑ';
+  const esc = p.replace(/[.*+?^$(){}|[\]\\]/g, '\\$&');
+  return new RegExp('(^|[^' + letra + '])' + esc + '([^' + letra + ']|$)').test(descU);
+}
+
+// `palabraCompleta` solo se activa para descripciones del banco (cartola). El detalle escrito a
+// mano en el cuaderno de cierre sigue buscándose como texto corrido ("Panes" sigue siendo PAN).
+function clasificarMovimientoEnMemoria(descripcion, aprendidos, proveedoresReales, usarDiccionarioEstatico = true, palabraCompleta = false) {
   const descU = String(descripcion || '').toUpperCase();
   for (const r of aprendidos) {
-    if (descU.indexOf(String(r.patron).toUpperCase()) !== -1) return { tipo: r.tipo, categoria: r.categoria, nombre: r.nombre };
+    if (calzaReglaAprendida(descU, r.patron, palabraCompleta)) return { tipo: r.tipo, categoria: r.categoria, nombre: r.nombre };
   }
   if (usarDiccionarioEstatico) {
     for (const [patron, tipo, categoria, nombre] of DICCIONARIO_FINANZAS) {
@@ -367,7 +383,7 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   for (const f of candCargo) {
     if (yaExisten.has(f.clave) || clavesNuevas.has(f.clave)) continue;
     const nOp = nOperacionUnico(f.nOperacion);
-    const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos, proveedoresReales, cfgLocal(env).diccionarioEstatico);
+    const match = clasificarMovimientoEnMemoria(f.descripcion, aprendidos, proveedoresReales, cfgLocal(env).diccionarioEstatico, true);
     if (match) {
       stmts.push(env.DB.prepare(
         `INSERT INTO registros (nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, origen) VALUES (?,?,?,?,?,?,?,?)`
