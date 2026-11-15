@@ -37,7 +37,7 @@ CREATE TABLE producto_clasificacion_aprendida (patron TEXT PRIMARY KEY, proveedo
 CREATE TABLE producto_proveedor_id (sku TEXT NOT NULL, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id), PRIMARY KEY (sku, proveedor_id));
 CREATE TABLE producto_proveedores (sku TEXT NOT NULL, proveedor TEXT NOT NULL, PRIMARY KEY(sku, proveedor));
 CREATE TABLE push_subscriptions (endpoint TEXT PRIMARY KEY, p256dh TEXT, auth TEXT, creado TEXT);
-CREATE TABLE registros (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL, fecha TEXT NOT NULL, categoria TEXT NOT NULL, tipo TEXT NOT NULL CHECK (tipo IN ('INGRESO','COSTOS','GASTO OPE','MERMA','PLASTICOS','RETIRO_UTILIDAD','PRESTAMO','IMPUESTOS','INVERSION','TRASPASO_INTERNO')), cuenta TEXT NOT NULL CHECK (cuenta IN ('BANCO','EFECTIVO')), monto INTEGER NOT NULL, n_operacion TEXT NOT NULL UNIQUE, origen TEXT, subtipo_original TEXT, creado_en TEXT NOT NULL DEFAULT (datetime('now')), actualizado_en TEXT);
+CREATE TABLE registros (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL, fecha TEXT NOT NULL, categoria TEXT NOT NULL, tipo TEXT NOT NULL CHECK (tipo IN ('INGRESO','COSTOS','GASTO OPE','MERMA','PLASTICOS','RETIRO_UTILIDAD','PRESTAMO','IMPUESTOS','INVERSION','TRASPASO_INTERNO','PAGO DEUDA')), cuenta TEXT NOT NULL CHECK (cuenta IN ('BANCO','EFECTIVO')), monto INTEGER NOT NULL, n_operacion TEXT NOT NULL UNIQUE, origen TEXT, subtipo_original TEXT, creado_en TEXT NOT NULL DEFAULT (datetime('now')), actualizado_en TEXT);
 CREATE TABLE riesgo_excluidos (sku TEXT PRIMARY KEY, fecha TEXT NOT NULL, responsable TEXT);
 CREATE TABLE sectores (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL UNIQUE);
 CREATE TABLE sectores_personalizados (nombre TEXT PRIMARY KEY);
