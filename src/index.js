@@ -265,6 +265,36 @@ async function clasificarMovimientoFinanzas(env, descripcion) {
   return clasificarMovimientoEnMemoria(descripcion, aprendidos, null, cfgLocal(env).diccionarioEstatico);
 }
 
+// Abonos a la deuda de sueldo de Rossy: la app "Deuda sueldo Rossy" registra SOLO abonos de deuda (no las
+// quincenas del sueldo). Todo registro PAGO DEUDA / SUELDO DEUDA de finanzas debe estar ahí, venga del
+// cierre de caja, de la cartola del banco o de una fila agregada/editada a mano. Esta función compara por
+// (fecha, monto) lo que hay en finanzas con lo que ya tiene esa app e inserta SOLO lo que falte: se puede
+// llamar las veces que sea sin duplicar. Nunca borra nada de la otra app. Si falla, no bloquea la acción.
+async function sincronizarAbonosDeudaRossy(env) {
+  if (!cfgLocal(env).espejoDeudaRossy || !env.DB_DEUDA_ROSSY) return 0;
+  try {
+    const abonos = (await env.DB.prepare(
+      "SELECT fecha, monto, nombre FROM registros WHERE tipo = 'PAGO DEUDA' AND UPPER(TRIM(categoria)) = 'SUELDO DEUDA' AND fecha >= ? ORDER BY fecha, id"
+    ).bind(cfgLocal(env).fechaInicio).all()).results;
+    if (!abonos.length) return 0;
+    const yaEstan = (await env.DB_DEUDA_ROSSY.prepare(
+      "SELECT fecha, monto FROM payments WHERE category_id = 'app_gastos_sep2026'"
+    ).all()).results;
+    const cuenta = {};
+    yaEstan.forEach(p => { const k = p.fecha + '|' + Number(p.monto); cuenta[k] = (cuenta[k] || 0) + 1; });
+    const nuevos = [];
+    for (const a of abonos) {
+      const k = a.fecha + '|' + Number(a.monto);
+      if (cuenta[k] > 0) cuenta[k]--; else nuevos.push(a);
+    }
+    if (!nuevos.length) return 0;
+    await env.DB_DEUDA_ROSSY.batch(nuevos.map(a => env.DB_DEUDA_ROSSY.prepare(
+      "INSERT INTO payments (category_id, fecha, monto, nota) VALUES ('app_gastos_sep2026', ?, ?, ?)"
+    ).bind(a.fecha, Number(a.monto), a.nombre || 'Rossy')));
+    return nuevos.length;
+  } catch (e) { return 0; }
+}
+
 async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   // Separar candidatos válidos (abono o cargo) sin tocar la DB todavía
   const candAbono = [], candCargo = [];
@@ -400,6 +430,7 @@ async function ingestarCartolaDesdeFilas(env, filasCrudas, nombreArchivo) {
   }
 
   if (stmts.length) await batchRun(env, stmts, 100);
+  await sincronizarAbonosDeudaRossy(env); // los abonos de Rossy que entraron por el banco también van a su app
   return { total_filas: filasCrudas.length, escritos_registros: escritos, enviados_a_revisar: revisar, duplicados_omitidos: duplicados };
 }
 
@@ -569,6 +600,7 @@ async function financieroEditarFila(env, body) {
   campos.push("actualizado_en = datetime('now')");
   valores.push(id);
   await env.DB.prepare(`UPDATE registros SET ${campos.join(', ')} WHERE id = ?`).bind(...valores).run();
+  if (v.tipo === 'PAGO DEUDA' || String(v.categoria || '').toUpperCase() === 'SUELDO DEUDA') await sincronizarAbonosDeudaRossy(env);
   return { ok: true, fila: id };
 }
 
@@ -602,6 +634,7 @@ async function financieroAgregarFila(env, body) {
       ).bind(String(clave).toUpperCase(), v.tipo, v.categoria, v.nombre || clave).run();
     }
   }
+  if (v.tipo === 'PAGO DEUDA') await sincronizarAbonosDeudaRossy(env);
   return { ok: true };
 }
 
@@ -750,6 +783,7 @@ async function financieroGuardarCierre(env, body) {
       // base, que se puede reingresar a mano después.
     }
   }
+  await sincronizarAbonosDeudaRossy(env); // junta también lo que faltara de la cartola o de filas a mano
   return { ok: true, filas };
 }
 
