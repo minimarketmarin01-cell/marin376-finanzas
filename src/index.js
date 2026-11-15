@@ -633,7 +633,8 @@ async function financieroLeerCierre(env, body) {
     '"OTROS EFECTIVO" y tipo "GASTO OPE"):\n' +
     (cfgLocal(env).personalCierre
       ? '- "Isabel" (persona) -> categoria "ISABEL", tipo "ISABEL" (línea de ensaladas)\n' +
-        '- "Rossy"/"Sueldo" -> categoria "SUELDO", tipo "GASTO OPE"\n'
+        '- "Rossy"/"Sueldo" (abono diario a su sueldo atrasado) -> categoria "SUELDO DEUDA", tipo "PAGO DEUDA"\n' +
+        '- "Rossy" con "horas extras" -> categoria "HORAS EXTRAS", tipo "GASTO OPE"\n'
       : '- "Sueldo" -> categoria "SUELDO", tipo "GASTO OPE"\n') +
     '- "Bolsas"/plástico -> categoria "BOLSAS", tipo "PLASTICOS"\n' +
     '- Proveedores de fruta/verdura/abarrotes/panadería (ej. "Boom", "Vega", nombres propios de personas) -> tipo "COSTOS"\n' +
@@ -986,6 +987,46 @@ async function payloadFinanciero(env) {
     retiroPorSubtipoYm[r.ym][r.subtipo] = Number(r.total) || 0;
   });
 
+  // --- Sueldo atrasado de Rossy (solo Marín) ---
+  // Los abonos del cuaderno (categoría SUELDO DEUDA) se guardan con tipo PAGO DEUDA: son plata que
+  // sale de la caja para saldar sueldo de meses anteriores, NO costo de este mes — no restan de la
+  // utilidad ni del gasto operacional (egresos no incluye PAGO DEUDA), pero sí cuentan en el flujo
+  // diario y en la caja. Excepción: si ese mes el banco no cubrió todo el sueldo (ej. pagó una sola
+  // quincena y la otra salió en efectivo del cuaderno), la parte que falta para completar el sueldo
+  // mínimo vigente SÍ es costo del mes: se pasa de PAGO DEUDA a GASTO OPE / SUELDO. Así no hay que
+  // decidir pago por pago: se anota todo igual y la app separa sola.
+  if (cfgLocal(env).espejoDeudaRossy) {
+    try {
+      const tramos = env.DB_DEUDA_ROSSY
+        ? (await env.DB_DEUDA_ROSSY.prepare("SELECT from_date, to_date, monto FROM salary_tramos").all()).results : [];
+      const sueldoMinimo = ym => {
+        const t = tramos.find(x => x.from_date <= ym + '-01' && ym + '-01' <= x.to_date);
+        return t ? Number(t.monto) : 0;
+      };
+      const [sueldoRossyRows, deudaRows] = await Promise.all([
+        env.DB.prepare(
+          `SELECT substr(fecha,1,7) AS ym, SUM(monto) AS total FROM registros
+           WHERE fecha >= ? AND tipo='GASTO OPE' AND UPPER(TRIM(categoria))='SUELDO' AND UPPER(nombre) LIKE '%ROSSY%' GROUP BY ym`
+        ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+        env.DB.prepare(
+          `SELECT substr(fecha,1,7) AS ym, SUM(monto) AS total FROM registros
+           WHERE fecha >= ? AND tipo='PAGO DEUDA' AND UPPER(TRIM(categoria))='SUELDO DEUDA' GROUP BY ym`
+        ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
+      ]);
+      const sueldoRossy = {}; sueldoRossyRows.forEach(r => { sueldoRossy[r.ym] = Number(r.total) || 0; });
+      deudaRows.forEach(r => {
+        const abonos = Number(r.total) || 0, minimo = sueldoMinimo(r.ym);
+        const completado = Math.min(abonos, Math.max(0, minimo - (sueldoRossy[r.ym] || 0)));
+        if (completado <= 0) return;
+        const M = ensureYm(r.ym);
+        M.tipos['GASTO OPE'] = (M.tipos['GASTO OPE'] || 0) + completado;
+        M.tipos['PAGO DEUDA'] = (M.tipos['PAGO DEUDA'] || 0) - completado;
+        M.gastoCats['SUELDO'] = (M.gastoCats['SUELDO'] || 0) + completado;
+        M.sueldoCompletadoDeuda = completado;
+      });
+    } catch (e) { /* sin la base de la deuda no se completa nada: queda todo como PAGO DEUDA */ }
+  }
+
   const conteoTxRows = (await env.DB.prepare("SELECT ym, n_transacciones FROM control_tx").all()).results;
   const conteoTx = {};
   conteoTxRows.forEach(r => conteoTx[r.ym] = r.n_transacciones);
@@ -1311,6 +1352,7 @@ async function payloadFinanciero(env) {
     salida.meses.push({
       ym, ingreso: ing, costos: cos, gastoOpe: gop, merma: mer, plasticos: pla,
       impuestos: imp, inversion: inv,
+      pagoDeuda: M.tipos['PAGO DEUDA'] || 0, sueldoCompletadoDeuda: M.sueldoCompletadoDeuda || 0,
       retiroUtilidad: retiroUtilidadMes, retiroPorSubtipo: retiroPorSubtipoYm[ym] || {},
       ventaPorSector: ventaPorSectorYm[ym] || {}, rotacionProveedor,
       margenGlobal: { pct: margenGlobalPct, ventaTotal: ventaTotalConSector, utilidadTotal: utilidadTotalConSector, porSector: margenPorSector },
