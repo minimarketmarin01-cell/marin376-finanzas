@@ -664,6 +664,27 @@ function aNumeroMonto(v) {
   return isFinite(n) ? n : 0;
 }
 
+// El cuaderno calcula la venta en efectivo así: Caja (apertura) − gastos = caja neta; Efectivo (contado al cierre) −
+// caja neta = venta en efectivo. Con esas tres cifras se recalcula y se compara con lo que se leyó, porque un modelo
+// gratuito se equivoca más con los dígitos. Prioridad: lo escrito en el cuaderno; si falta, se usa lo calculado.
+// Devuelve { ok, calculada, mensaje, nivel } y puede completar extraido.venta_efectivo cuando venía en 0.
+function verificarVentaEfectivo(extraido) {
+  const caja = aNumeroMonto(extraido.caja), efectivo = aNumeroMonto(extraido.efectivo_total);
+  const gastos = (extraido.costos_efectivo || []).reduce((a, c) => a + aNumeroMonto(c.monto), 0);
+  const leida = aNumeroMonto(extraido.venta_efectivo);
+  const fmt = n => (n < 0 ? '-$' : '$') + String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  extraido.caja = caja; extraido.efectivo_total = efectivo;
+  if (!caja || !efectivo) return { ok: null, calculada: null, mensaje: leida ? '' : 'No se pudo leer "Caja" y "Efectivo" para verificar la venta: revísala a mano.', nivel: leida ? '' : 'aviso' };
+  const calculada = efectivo - caja + gastos;
+  const cuenta = 'Efectivo ' + fmt(efectivo) + ' − Caja ' + fmt(caja) + ' + gastos ' + fmt(gastos) + ' = ' + fmt(calculada);
+  if (calculada < 0) return { ok: false, calculada, mensaje: 'No cuadra: ' + cuenta + '. Alguna cifra de Caja, Efectivo o los gastos se leyó mal; revísalas.', nivel: 'aviso' };
+  if (!leida) { extraido.venta_efectivo = calculada; return { ok: true, calculada, mensaje: 'Venta en efectivo calculada (no estaba escrita): ' + cuenta + '. Confírmala.', nivel: 'aviso' }; }
+  if (leida === calculada) return { ok: true, calculada, mensaje: 'Cuadra: ' + cuenta + '.', nivel: 'ok' };
+  // Error típico: tomar el total contado ("Efectivo") como si fuera la venta. Se corrige con la cuenta del cuaderno.
+  if (leida === efectivo) { extraido.venta_efectivo = calculada; return { ok: true, calculada, mensaje: 'La IA leyó el total "Efectivo" (' + fmt(efectivo) + ') como venta; se corrigió con la cuenta del cuaderno: ' + cuenta + '. Confírmala.', nivel: 'aviso' }; }
+  return { ok: false, calculada, mensaje: 'No cuadra: el cuaderno dice ' + fmt(leida) + ' pero ' + cuenta + '. Revisa los números en la foto (también pueden faltar gastos en la lista).', nivel: 'aviso' };
+}
+
 async function leerFotoConWorkersAI(env, prompt, imagenBase64, mediaType) {
   const modelos = env.MODELO_FOTO ? String(env.MODELO_FOTO).split(',').map(x => x.trim()).filter(Boolean) : MODELOS_FOTO;
   const url = 'data:' + (mediaType || 'image/jpeg') + ';base64,' + imagenBase64;
@@ -746,14 +767,26 @@ async function financieroLeerCierre(env, body) {
     '- "Bolsas"/plástico -> categoria "BOLSAS", tipo "PLASTICOS"\n' +
     '- Proveedores de fruta/verdura/abarrotes/panadería (ej. "Boom", "Vega", nombres propios de personas) -> tipo "COSTOS"\n' +
     '- Agua, luz, mantención, insumos de limpieza (ej. "Lavadora", "Amasado") -> tipo "GASTO OPE"\n\n' +
+    'CÓMO ES EL CUADERNO (así se calcula la venta en efectivo del día):\n' +
+    '- Arriba va la fecha (ej. "01-11-26" = 01/11/2026; a veces con el día de la semana, que se ignora) y "Gastos:" con la lista de gastos del día, cada uno con su monto.\n' +
+    '- "Caja" es el saldo con que abrió la caja ese día. Justo debajo se escribe el resultado de restarle los gastos (con signo "−").\n' +
+    '- "Efectivo" es el TOTAL de dinero en efectivo contado al cerrar. Justo debajo se escribe, con signo "+", la resta ' +
+    'Efectivo − (Caja menos gastos): ESE número con "+" es la VENTA EN EFECTIVO del día.\n' +
+    '- "Tarjetas" y los números que siguen (otras ventas y el total del día) NO son gastos ni son la venta en efectivo: ignóralos.\n' +
+    'EJEMPLO REAL:\n' +
+    'Domingo / 01-11-26 / Gastos: / Pasaje: 1000 − / Caja: 241.530 / 240.530 − / Efectivo 344.540 / 104.010 + / tarjetas 222.106 / 448.442 / 774.558\n' +
+    'Respuesta correcta: {"fecha":"01/11/2026","venta_efectivo":104010,"caja":241530,"efectivo_total":344540,' +
+    '"costos_efectivo":[{"detalle":"Pasaje","monto":1000,"categoria":"PASAJE","tipo":"GASTO OPE"}]}\n' +
+    '(104.010 sale de 344.540 − 240.530; 240.530 sale de 241.530 − 1.000. Caja, Efectivo, tarjetas y los totales NO van en costos_efectivo.)\n\n' +
     'Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin markdown:\n' +
     '{\n' +
     '  "fecha": "DD/MM/AAAA o vacío si no aparece",\n' +
-    '  "venta_efectivo": número (SOLO si encuentras la etiqueta literal escrita a mano ' +
-    '"Venta efectivo" en la foto —a veces con una flecha "→" apuntando a un número—, usa EXACTAMENTE ' +
-    'ese número tal cual está escrito. NO calcules ni restes tú mismo esta cifra, y NO uses el número ' +
-    'de la línea "Efectivo" (el total de caja) como si fuera la venta en efectivo: son cosas distintas. ' +
-    'Si no encuentras la etiqueta "Venta efectivo" explícita en la foto, devuelve 0.),\n' +
+    '  "venta_efectivo": número (la venta en efectivo del día: el número con signo "+" que el cuaderno escribe justo debajo ' +
+    'de la línea "Efectivo", o el que esté junto a la etiqueta "Venta efectivo" —a veces con una flecha "→"—. Cópialo EXACTAMENTE como ' +
+    'está escrito; NO lo calcules tú. NUNCA uses la cifra de la línea "Efectivo" (el total contado, p. ej. 344.540) como venta. ' +
+    'Si no hay ninguno de los dos, devuelve 0.),\n' +
+    '  "caja": número (la cifra de la línea "Caja", el saldo de apertura; 0 si no aparece),\n' +
+    '  "efectivo_total": número (la cifra de la línea "Efectivo", el total contado al cierre; 0 si no aparece),\n' +
     '  "costos_efectivo": [ {"detalle":"texto tal cual aparece", "monto":número, "categoria":"...", "tipo":"..."} ]\n' +
     '}\n' +
     'Los montos en Chile usan punto como separador de miles (ej: 45.000 = 45000). ' +
@@ -776,6 +809,9 @@ async function financieroLeerCierre(env, body) {
     .filter(c => c && typeof c === 'object')
     .map(c => Object.assign({}, c, { detalle: String(c.detalle || ''), monto: aNumeroMonto(c.monto) }));
 
+  // Verificación aritmética del cuaderno (no depende de la IA): venta en efectivo = Efectivo − Caja + gastos del día.
+  const verificacion = verificarVentaEfectivo(extraido);
+
   const aprendidos = await cargarDiccionarioAprendido(env);
   const proveedoresReales = Object.values(await cargarMapaProveedoresReales(env));
   (extraido.costos_efectivo || []).forEach(cst => {
@@ -783,7 +819,7 @@ async function financieroLeerCierre(env, body) {
     if (m) { cst.categoria = m.categoria; cst.tipo = m.tipo; }
   });
 
-  return { ok: true, extraido, lector: lector === 'claude' ? 'claude' : 'workers-ai', modelo: lectura.modelo };
+  return { ok: true, extraido, verificacion, lector: lector === 'claude' ? 'claude' : 'workers-ai', modelo: lectura.modelo };
 }
 
 async function financieroGuardarCierre(env, body) {
