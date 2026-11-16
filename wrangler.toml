@@ -16,3 +16,7 @@ database_id = "bf33a21d-5fb9-48be-b877-b4e914beafc5"
 binding = "DB_DEUDA_ROSSY"
 database_name = "deuda_sueldo_rossy"
 database_id = "03b54ed8-ac3a-4bc0-aae6-379b881ab68e"
+
+# Workers AI: lectura gratuita de la foto del cierre de caja
+[ai]
+binding = "AI"
