@@ -645,9 +645,83 @@ async function financieroQuitarRevisar(env, body) {
   return { ok: true };
 }
 
-async function financieroLeerCierre(env, body) {
+// Lectura de la foto del cuaderno. Por defecto usa Cloudflare Workers AI (gratis hasta ~10.000 "neuronas" al
+// día, sin clave ni créditos); si el Worker no tiene el binding AI, o LECTOR_FOTO = "claude", usa la API de
+// Claude (de pago). Los modelos de visión se prueban en orden y el primero que responda gana; se pueden
+// cambiar sin tocar el código con la variable MODELO_FOTO (lista separada por comas).
+const MODELOS_FOTO = ['@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/meta/llama-3.2-11b-vision-instruct'];
+
+function extraerJSONdeTexto(texto) {
+  let t = String(texto || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+  const i = t.indexOf('{'), j = t.lastIndexOf('}');
+  if (i >= 0 && j > i) t = t.slice(i, j + 1);
+  return t;
+}
+// Los modelos pequeños a veces devuelven los montos como texto ("30.000", "$12.500"): se llevan a número.
+function aNumeroMonto(v) {
+  if (typeof v === 'number') return isFinite(v) ? Math.round(v) : 0;
+  const n = Number(String(v == null ? '' : v).replace(/[^\d]/g, ''));
+  return isFinite(n) ? n : 0;
+}
+
+async function leerFotoConWorkersAI(env, prompt, imagenBase64, mediaType) {
+  const modelos = env.MODELO_FOTO ? String(env.MODELO_FOTO).split(',').map(x => x.trim()).filter(Boolean) : MODELOS_FOTO;
+  const url = 'data:' + (mediaType || 'image/jpeg') + ';base64,' + imagenBase64;
+  const errores = [];
+  for (const modelo of modelos) {
+    const pedido = () => env.AI.run(modelo, {
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url } }] }],
+      max_tokens: 2048, temperature: 0
+    });
+    try {
+      let r;
+      try { r = await pedido(); }
+      catch (e) {
+        // Llama 3.2 Vision pide aceptar su licencia una sola vez por cuenta enviando el texto "agree".
+        if (/agree/i.test(String(e && e.message))) { await env.AI.run(modelo, { prompt: 'agree' }).catch(() => {}); r = await pedido(); }
+        else throw e;
+      }
+      const texto = (r && (r.response || (r.choices && r.choices[0] && r.choices[0].message && r.choices[0].message.content))) || '';
+      if (typeof texto === 'object') return { texto: JSON.stringify(texto), modelo };
+      if (String(texto).trim()) return { texto: String(texto), modelo };
+      errores.push(modelo + ': respuesta vacía');
+    } catch (e) { errores.push(modelo + ': ' + String((e && e.message) || e).slice(0, 160)); }
+  }
+  return { error: errores.join(' | ') || 'Sin modelos de visión configurados' };
+}
+
+async function leerFotoConClaude(env, prompt, imagenBase64, mediaType) {
   const apiKey = env.CLAUDE_API_KEY || env.ANTHROPIC_API_KEY;
-  if (!apiKey) return { ok: false, error: 'Falta el secreto CLAUDE_API_KEY en el Worker (Settings → Variables and Secrets)' };
+  if (!apiKey) return { error: 'Falta el secreto CLAUDE_API_KEY en el Worker (Settings → Variables and Secrets)' };
+  const payload = {
+    model: 'claude-sonnet-5',
+    max_tokens: 4096, // un cierre con muchas líneas de costos puede superar 1024 y cortar el JSON a la mitad
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imagenBase64 } },
+        { type: 'text', text: prompt }
+      ]
+    }]
+  };
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!resp.ok) {
+    let msg = 'HTTP ' + resp.status;
+    try { const j = await resp.json(); if (j.error && j.error.message) msg += ' - ' + j.error.message; } catch (e) { }
+    return { error: msg };
+  }
+  const data = await resp.json();
+  if (data.error) return { error: data.error.message || 'Error de Claude API' };
+  let texto = '';
+  (data.content || []).forEach(b => { if (b.type === 'text') texto += b.text; });
+  return { texto, modelo: 'claude-sonnet-5' };
+}
+
+async function financieroLeerCierre(env, body) {
   if (!body.imagenBase64) return { ok: false, error: 'No llegó la imagen' };
 
   const prompt =
@@ -685,38 +759,22 @@ async function financieroLeerCierre(env, body) {
     'Los montos en Chile usan punto como separador de miles (ej: 45.000 = 45000). ' +
     'Si un número es ilegible, ponlo en 0 y no inventes. Devuelve solo el JSON.';
 
-  const payload = {
-    model: 'claude-sonnet-5',
-    max_tokens: 4096, // un cierre con muchas líneas de costos puede superar 1024 y cortar el JSON a la mitad
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: body.mediaType || 'image/jpeg', data: body.imagenBase64 } },
-        { type: 'text', text: prompt }
-      ]
-    }]
-  };
+  const lector = String(env.LECTOR_FOTO || (env.AI ? 'workers-ai' : 'claude')).toLowerCase();
+  if (lector !== 'claude' && !env.AI) return { ok: false, error: 'Falta el binding AI (Workers AI) en el Worker' };
+  const lectura = lector === 'claude'
+    ? await leerFotoConClaude(env, prompt, body.imagenBase64, body.mediaType)
+    : await leerFotoConWorkersAI(env, prompt, body.imagenBase64, body.mediaType);
+  if (lectura.error) return { ok: false, error: lectura.error };
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  if (!resp.ok) {
-    let msg = 'HTTP ' + resp.status;
-    try { const j = await resp.json(); if (j.error && j.error.message) msg += ' - ' + j.error.message; } catch (e) { }
-    return { ok: false, error: msg };
-  }
-  const data = await resp.json();
-  if (data.error) return { ok: false, error: data.error.message || 'Error de Claude API' };
-
-  let texto = '';
-  (data.content || []).forEach(b => { if (b.type === 'text') texto += b.text; });
-  texto = texto.replace(/```json/gi, '').replace(/```/g, '').trim();
+  const texto = extraerJSONdeTexto(lectura.texto);
   let extraido;
   try { extraido = JSON.parse(texto); }
-  catch (e) { return { ok: false, error: 'No se pudo interpretar la respuesta', crudo: texto }; }
+  catch (e) { return { ok: false, error: 'No se pudo interpretar la respuesta', crudo: String(lectura.texto || '').slice(0, 500) }; }
+  if (!extraido || typeof extraido !== 'object') return { ok: false, error: 'No se pudo interpretar la respuesta', crudo: String(lectura.texto || '').slice(0, 500) };
+  extraido.venta_efectivo = aNumeroMonto(extraido.venta_efectivo);
+  extraido.costos_efectivo = (Array.isArray(extraido.costos_efectivo) ? extraido.costos_efectivo : [])
+    .filter(c => c && typeof c === 'object')
+    .map(c => Object.assign({}, c, { detalle: String(c.detalle || ''), monto: aNumeroMonto(c.monto) }));
 
   const aprendidos = await cargarDiccionarioAprendido(env);
   const proveedoresReales = Object.values(await cargarMapaProveedoresReales(env));
@@ -725,7 +783,7 @@ async function financieroLeerCierre(env, body) {
     if (m) { cst.categoria = m.categoria; cst.tipo = m.tipo; }
   });
 
-  return { ok: true, extraido };
+  return { ok: true, extraido, lector: lector === 'claude' ? 'claude' : 'workers-ai', modelo: lectura.modelo };
 }
 
 async function financieroGuardarCierre(env, body) {
