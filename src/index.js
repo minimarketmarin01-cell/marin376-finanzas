@@ -1012,8 +1012,20 @@ async function payloadFinanciero(env) {
     ingresoRows,
     retiroSubtipoRows
   ] = await Promise.all([
+    // Las ventas con tarjeta de Compraquí (origen SCQ) son 1 fila de venta + 1 de comisión POR
+    // TRANSACCIÓN (~4.500 al mes, ~9.000 filas por mes). Mandarlas una a una hacía que el panel
+    // bajara 3,7 MB y tardara varios segundos en "Conectando…". Para la tabla se mandan sumadas
+    // por día (los totales ya salen de los SUM() de abajo, que no cambian). El id va NEGATIVO
+    // para que editar o borrar una fila sumada no toque ninguna transacción real.
     env.DB.prepare(
-      "SELECT id, nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, subtipo_original FROM registros WHERE fecha >= ? ORDER BY fecha"
+      `SELECT id, nombre, fecha, categoria, tipo, cuenta, monto, n_operacion, subtipo_original
+         FROM registros WHERE fecha >= ?1 AND (origen IS NULL OR origen <> 'SCQ')
+       UNION ALL
+       SELECT -MIN(id) AS id, nombre, fecha, categoria, tipo, cuenta, SUM(monto) AS monto,
+              'SCQ-DIA-' || fecha AS n_operacion, '' AS subtipo_original
+         FROM registros WHERE fecha >= ?1 AND origen = 'SCQ'
+         GROUP BY fecha, nombre, categoria, tipo, cuenta
+       ORDER BY fecha`
     ).bind(FECHA_INICIO_FINANZAS).all().then(r => r.results),
     env.DB.prepare(
       `SELECT substr(fecha,1,7) AS ym, tipo, SUM(monto) AS total
