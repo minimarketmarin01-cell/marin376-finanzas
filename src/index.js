@@ -1003,6 +1003,215 @@ async function payloadFinanciero(env) {
   // El tiempo que la Worker espera la respuesta de D1 no cuenta como CPU time (solo cuenta el
   // cómputo que hace el propio JS) — por eso mover estas sumas a SQL reduce el uso real de CPU
   // de la Worker, que es justo lo que el plan gratis de Cloudflare limita a 10ms por petición.
+  // Todo lo que no depende de lo demás se lanza AHORA, junto, en vez de pedirlo de a una
+  // consulta a la vez más abajo (eran ~25 viajes seguidos a D1: unos 2-3 s solo de espera).
+  const _lanzar = pr => { pr.catch(() => {}); return pr; };
+  const pConteoTx = _lanzar(env.DB.prepare("SELECT ym, n_transacciones FROM control_tx").all());
+  const pPorRevisar = _lanzar(env.DB.prepare(
+    "SELECT id, fecha, n_operacion, descripcion, monto, motivo, archivo FROM por_revisar ORDER BY fecha"
+  ).all());
+  const pAprendidosGasto = _lanzar(env.DB.prepare("SELECT categoria FROM diccionario_aprendido WHERE tipo = 'GASTO OPE'").all());
+  const pCfg = _lanzar(env.DB.prepare("SELECT clave, valor FROM configuracion").all());
+  const pMapaProv = _lanzar(cargarMapaProveedoresReales(env));
+  const pQuiebre = _lanzar(calcularQuiebreValorizado(env));
+  const pSinRotacion = _lanzar(calcularCategoriasSinRotacion(env));
+
+  // --- Mermas y consumo interno (tabla `mermas`, compartida con Pedidos Marín 376) ---
+  let mermaPorYm = {}, mermaCategoriaYm = {}, consumoCategoriaYm = {}, consumoResponsableYm = {};
+  let mermasFilas = [];
+  const pMermas = (async () => {
+  try {
+    // `mermas` la llena Pedidos Marín 376 con fecha en DD/MM/AAAA (no ISO como `registros`),
+    // y algunas filas viejas quedaron en formato "AAAA-MM-DD HH:MM:SS". Comparar/agrupar por
+    // `fecha` tal cual (como se hacía antes) compara texto, no fechas: "03/09/2026" es MENOR
+    // que "2026-09-01" en orden alfabético (empieza con '0'), así que absolutamente ninguna
+    // fila en DD/MM/AAAA pasaba el filtro `fecha >= ?` — la tarjeta de mermas se veía vacía
+    // aunque hubiera decenas de registros reales ese mes. Se normaliza primero a ISO real.
+    const FECHA_ISO_MERMA = `CASE
+        WHEN fecha GLOB '[0-3][0-9]/[0-1][0-9]/[12][0-9][0-9][0-9]' THEN substr(fecha,7,4)||'-'||substr(fecha,4,2)||'-'||substr(fecha,1,2)
+        WHEN fecha GLOB '[12][0-9][0-9][0-9]-*' THEN substr(fecha,1,10)
+        ELSE NULL
+      END`;
+    const mermaRows = (await env.DB.prepare(
+      `WITH normalizado AS (
+         SELECT ${FECHA_ISO_MERMA} AS fecha_iso, motivo, categoria, responsable, costo_total
+         FROM mermas
+       )
+       SELECT substr(fecha_iso,1,7) AS ym, motivo, categoria, responsable, SUM(costo_total) AS total, COUNT(*) AS n
+       FROM normalizado WHERE fecha_iso >= ? GROUP BY ym, motivo, categoria, responsable`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    mermaRows.forEach(r => {
+      if (!mermaPorYm[r.ym]) mermaPorYm[r.ym] = { real: 0, consumoInterno: 0, cambioProveedor: 0, nReal: 0 };
+      const bucket = mermaPorYm[r.ym];
+      const motivo = String(r.motivo || '').toLowerCase();
+      const cat = r.categoria || 'SIN CATEGORÍA';
+      const resp = r.responsable || 'Sin responsable';
+
+      if (motivo === 'consumo_interno') {
+        // Aparte de la merma real — es retiro para uso propio, no pérdida de gestión.
+        bucket.consumoInterno += r.total || 0;
+        if (!consumoCategoriaYm[r.ym]) consumoCategoriaYm[r.ym] = {};
+        consumoCategoriaYm[r.ym][cat] = (consumoCategoriaYm[r.ym][cat] || 0) + (r.total || 0);
+        if (!consumoResponsableYm[r.ym]) consumoResponsableYm[r.ym] = {};
+        consumoResponsableYm[r.ym][resp] = (consumoResponsableYm[r.ym][resp] || 0) + (r.total || 0);
+      } else if (motivo === 'cambio_proveedor') {
+        bucket.cambioProveedor += r.total || 0;
+      } else {
+        bucket.real += r.total || 0; bucket.nReal += r.n || 0; // vencido, dañado, robo, liquidado
+        if (!mermaCategoriaYm[r.ym]) mermaCategoriaYm[r.ym] = {};
+        mermaCategoriaYm[r.ym][cat] = (mermaCategoriaYm[r.ym][cat] || 0) + (r.total || 0);
+      }
+    });
+
+    // Detalle a nivel de transacción individual (misma tabla, sin agrupar) — para el desglose
+    // expandible por categoría en el frontend (mismo patrón que `filas` para registros).
+    const mermasDetalleRows = (await env.DB.prepare(
+      `WITH normalizado AS (
+         SELECT id, ${FECHA_ISO_MERMA} AS fecha_iso, sku, producto, categoria, cantidad, costo_total, motivo, responsable
+         FROM mermas
+       )
+       SELECT id, fecha_iso, substr(fecha_iso,1,7) AS ym, sku, producto, categoria, cantidad, costo_total, motivo, responsable
+       FROM normalizado WHERE fecha_iso >= ? ORDER BY fecha_iso DESC`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    mermasFilas = mermasDetalleRows.map(r => ({
+      rowIndex: r.id, fecha: r.fecha_iso, ym: r.ym, sku: r.sku, producto: r.producto,
+      categoria: r.categoria || 'SIN CATEGORÍA', cantidad: r.cantidad, monto: r.costo_total,
+      motivo: String(r.motivo || '').toLowerCase(), responsable: r.responsable || ''
+    }));
+  } catch (e) { /* tabla mermas aún no disponible */ }
+  })();
+  // --- Mix SKU/m² y venta por SKU (misma base D1 que Pedidos Marín 376) ---
+  let skuActivos = 0, ventaTotalYm = {}, ventaPorCategoriaYm = {}, ventaPorProveedorYm = {}, ventaPorSectorYm = {}, margenPorSectorYm = {}, margenPorProveedorYm = {};
+  const pVentas = (async () => {
+  try {
+    const skuRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM productos").first();
+    skuActivos = (skuRow && skuRow.n) || 0;
+
+    const ventaTotalRows = (await env.DB.prepare(
+      `SELECT substr(fecha,1,7) AS ym, SUM(venta) AS venta FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) WHERE fecha >= ? AND sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
+    ventaTotalRows.forEach(r => ventaTotalYm[r.ym] = r.venta);
+
+    const ventaCatRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, p.categoria AS categoria, SUM(vdh.venta) AS venta
+       FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh JOIN productos p ON p.sku = vdh.sku
+       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.categoria`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
+    ventaCatRows.forEach(r => {
+      if (!ventaPorCategoriaYm[r.ym]) ventaPorCategoriaYm[r.ym] = {};
+      ventaPorCategoriaYm[r.ym][r.categoria] = r.venta;
+    });
+
+    // Venta por proveedor REAL (productos.proveedor_id → proveedores.nombre) — reemplaza el
+    // cruce por coincidencia de texto que usábamos antes de que Pedidos Marín separara los campos.
+    const ventaProvRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor, SUM(vdh.venta) AS venta
+       FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh
+       JOIN productos p ON p.sku = vdh.sku
+       JOIN proveedores pr ON pr.id = p.proveedor_id
+       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, pr.nombre`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
+    ventaProvRows.forEach(r => {
+      if (!ventaPorProveedorYm[r.ym]) ventaPorProveedorYm[r.ym] = {};
+      ventaPorProveedorYm[r.ym][r.proveedor] = r.venta;
+    });
+
+    // Venta por sector (productos.sector) — informativo, no hay cruce de compras por sector
+    // porque las compras (cartola/SCQ) no quedan ligadas a un SKU específico.
+    const ventaSectorRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, p.sector AS sector, SUM(vdh.venta) AS venta
+       FROM (
+         SELECT fecha, sku, venta FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh JOIN productos p ON p.sku = vdh.sku
+       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.sector`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
+    ventaSectorRows.forEach(r => {
+      if (!ventaPorSectorYm[r.ym]) ventaPorSectorYm[r.ym] = {};
+      ventaPorSectorYm[r.ym][r.sector] = r.venta;
+    });
+
+    // Margen real por sector (metodología Marcos Amorín: participación × margen por sector,
+    // sumado da el margen global ponderado). Usa la utilidad real que ya calcula Loyverse
+    // por cada venta (venta - costo del producto en ese momento) — no una aproximación por
+    // compras del mes, sino el costo real de lo efectivamente vendido.
+    const margenSectorRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, p.sector AS sector,
+              SUM(vdh.venta) AS venta, SUM(vdh.utilidad) AS utilidad
+       FROM (
+         SELECT fecha, sku, venta, utilidad FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta, utilidad FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh JOIN productos p ON p.sku = vdh.sku
+       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.sector`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
+    margenSectorRows.forEach(r => {
+      if (!margenPorSectorYm[r.ym]) margenPorSectorYm[r.ym] = {};
+      margenPorSectorYm[r.ym][r.sector] = { venta: r.venta, utilidad: r.utilidad };
+    });
+
+    // Margen real por proveedor (misma metodología Amorín que por sector, arriba): usa la
+    // utilidad real de Loyverse, no lo pagado en el mes — a diferencia de "Rotación por
+    // proveedor" (cash de la cartola), esto es inmune a compras grandes puntuales o meses sin
+    // cartola cargada para ese proveedor.
+    const margenProveedorRows = (await env.DB.prepare(
+      `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor,
+              SUM(vdh.venta) AS venta, SUM(vdh.utilidad) AS utilidad
+       FROM (
+         SELECT fecha, sku, venta, utilidad FROM ventas_diarias
+         UNION ALL
+         SELECT fecha, sku, venta, utilidad FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
+       ) vdh
+       JOIN productos p ON p.sku = vdh.sku
+       JOIN proveedores pr ON pr.id = p.proveedor_id
+       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, pr.nombre`
+    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
+    margenProveedorRows.forEach(r => {
+      if (!margenPorProveedorYm[r.ym]) margenPorProveedorYm[r.ym] = {};
+      margenPorProveedorYm[r.ym][r.proveedor] = { venta: r.venta, utilidad: r.utilidad };
+    });
+  } catch (e) { /* si productos/ventas_diarias_historico aún no existen, seguimos sin esto */ }
+  })();
+
+  // --- Fiados: venta a crédito (método de pago "otros" en Loyverse) y sus abonos ---
+  // Las llena Pedidos Marín 376 (marin376-api), que ya tiene el módulo completo: `fiados` es
+  // cada venta fiada (con SKUs reales, ya contada en ventas_diarias/"Ventas registradas" de
+  // arriba — no es venta aparte, solo no se cobró); `pagos_fiado` es cada abono/cobro real,
+  // con método de pago y cliente. El SKU_ABONO_FIADO ("Abono Fiado" en ventas_diarias, ya
+  // excluido arriba) es solo el mecanismo con que ese sistema cuadra la caja en Loyverse — esta
+  // tabla es la fuente estructurada real para el monto de abonos, más precisa que inferirlo del
+  // SKU ficticio.
+  let fiadoGeneradoYm = {}, abonosFiadoYm = {};
+  const pFiados = (async () => {
+  try {
+    const fiadoGeneradoRows = (await env.DB.prepare(
+      `SELECT substr(fecha_hora,1,7) AS ym, SUM(monto_total) AS total
+       FROM fiados WHERE fecha_hora >= ? GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    fiadoGeneradoRows.forEach(r => fiadoGeneradoYm[r.ym] = r.total || 0);
+
+    const abonosFiadoRows = (await env.DB.prepare(
+      `SELECT substr(fecha_hora,1,7) AS ym, SUM(monto) AS total
+       FROM pagos_fiado WHERE fecha_hora >= ? GROUP BY ym`
+    ).bind(FECHA_INICIO_FINANZAS).all()).results;
+    abonosFiadoRows.forEach(r => abonosFiadoYm[r.ym] = r.total || 0);
+  } catch (e) { /* tablas de fiados aún no disponibles */ }
+  })();
+
+
   const [
     filasDB,
     tiposRows,
@@ -1064,7 +1273,7 @@ async function payloadFinanciero(env) {
   const meses = {};
   const filasTabla = [];
   const retiroPorSubtipoYm = {};
-  const mapaProveedoresReales = await cargarMapaProveedoresReales(env);
+  const mapaProveedoresReales = await pMapaProv;
 
   const ensureYm = (ym) => {
     if (!meses[ym]) {
@@ -1167,13 +1376,11 @@ async function payloadFinanciero(env) {
     } catch (e) { /* sin la base de la deuda no se completa nada: queda todo como PAGO DEUDA */ }
   }
 
-  const conteoTxRows = (await env.DB.prepare("SELECT ym, n_transacciones FROM control_tx").all()).results;
+  const conteoTxRows = (await pConteoTx).results;
   const conteoTx = {};
   conteoTxRows.forEach(r => conteoTx[r.ym] = r.n_transacciones);
 
-  const porRevisarRows = (await env.DB.prepare(
-    "SELECT id, fecha, n_operacion, descripcion, monto, motivo, archivo FROM por_revisar ORDER BY fecha"
-  ).all()).results;
+  const porRevisarRows = (await pPorRevisar).results;
   const porRevisar = porRevisarRows.map(r => ({
     fila: r.id, fecha: r.fecha || '', nop: r.n_operacion || '', descripcion: r.descripcion || '',
     monto: Number(r.monto) || 0, motivo: r.motivo || '', archivo: r.archivo || ''
@@ -1191,213 +1398,25 @@ async function payloadFinanciero(env) {
   const setCatsGastoOpe = new Set();
   filasTabla.forEach(f => { if (f.tipo === 'GASTO OPE' && f.categoria) setCatsGastoOpe.add(String(f.categoria).toUpperCase().trim()); });
   try {
-    const aprendidosGasto = await env.DB.prepare("SELECT categoria FROM diccionario_aprendido WHERE tipo = 'GASTO OPE'").all();
+    const aprendidosGasto = await pAprendidosGasto;
     aprendidosGasto.results.forEach(r => { if (r.categoria) setCatsGastoOpe.add(String(r.categoria).toUpperCase().trim()); });
   } catch (e) { /* tabla vacía, seguimos */ }
 
   const categorias = Array.from(new Set([...proveedoresReales, ...setCatsGastoOpe])).sort();
 
   // --- Configuración (m², % distribución de utilidad) ---
-  const cfgRows = (await env.DB.prepare("SELECT clave, valor FROM configuracion").all()).results;
+  const cfgRows = (await pCfg).results;
   const config = {};
   cfgRows.forEach(r => config[r.clave] = r.valor);
   const areaVentasM2 = Number(config.area_ventas_m2) || 0;
 
-  // --- Mermas y consumo interno (tabla `mermas`, compartida con Pedidos Marín 376) ---
-  let mermaPorYm = {}, mermaCategoriaYm = {}, consumoCategoriaYm = {}, consumoResponsableYm = {};
-  let mermasFilas = [];
-  try {
-    // `mermas` la llena Pedidos Marín 376 con fecha en DD/MM/AAAA (no ISO como `registros`),
-    // y algunas filas viejas quedaron en formato "AAAA-MM-DD HH:MM:SS". Comparar/agrupar por
-    // `fecha` tal cual (como se hacía antes) compara texto, no fechas: "03/09/2026" es MENOR
-    // que "2026-09-01" en orden alfabético (empieza con '0'), así que absolutamente ninguna
-    // fila en DD/MM/AAAA pasaba el filtro `fecha >= ?` — la tarjeta de mermas se veía vacía
-    // aunque hubiera decenas de registros reales ese mes. Se normaliza primero a ISO real.
-    const FECHA_ISO_MERMA = `CASE
-        WHEN fecha GLOB '[0-3][0-9]/[0-1][0-9]/[12][0-9][0-9][0-9]' THEN substr(fecha,7,4)||'-'||substr(fecha,4,2)||'-'||substr(fecha,1,2)
-        WHEN fecha GLOB '[12][0-9][0-9][0-9]-*' THEN substr(fecha,1,10)
-        ELSE NULL
-      END`;
-    const mermaRows = (await env.DB.prepare(
-      `WITH normalizado AS (
-         SELECT ${FECHA_ISO_MERMA} AS fecha_iso, motivo, categoria, responsable, costo_total
-         FROM mermas
-       )
-       SELECT substr(fecha_iso,1,7) AS ym, motivo, categoria, responsable, SUM(costo_total) AS total, COUNT(*) AS n
-       FROM normalizado WHERE fecha_iso >= ? GROUP BY ym, motivo, categoria, responsable`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
-    mermaRows.forEach(r => {
-      if (!mermaPorYm[r.ym]) mermaPorYm[r.ym] = { real: 0, consumoInterno: 0, cambioProveedor: 0, nReal: 0 };
-      const bucket = mermaPorYm[r.ym];
-      const motivo = String(r.motivo || '').toLowerCase();
-      const cat = r.categoria || 'SIN CATEGORÍA';
-      const resp = r.responsable || 'Sin responsable';
-
-      if (motivo === 'consumo_interno') {
-        // Aparte de la merma real — es retiro para uso propio, no pérdida de gestión.
-        bucket.consumoInterno += r.total || 0;
-        if (!consumoCategoriaYm[r.ym]) consumoCategoriaYm[r.ym] = {};
-        consumoCategoriaYm[r.ym][cat] = (consumoCategoriaYm[r.ym][cat] || 0) + (r.total || 0);
-        if (!consumoResponsableYm[r.ym]) consumoResponsableYm[r.ym] = {};
-        consumoResponsableYm[r.ym][resp] = (consumoResponsableYm[r.ym][resp] || 0) + (r.total || 0);
-      } else if (motivo === 'cambio_proveedor') {
-        bucket.cambioProveedor += r.total || 0;
-      } else {
-        bucket.real += r.total || 0; bucket.nReal += r.n || 0; // vencido, dañado, robo, liquidado
-        if (!mermaCategoriaYm[r.ym]) mermaCategoriaYm[r.ym] = {};
-        mermaCategoriaYm[r.ym][cat] = (mermaCategoriaYm[r.ym][cat] || 0) + (r.total || 0);
-      }
-    });
-
-    // Detalle a nivel de transacción individual (misma tabla, sin agrupar) — para el desglose
-    // expandible por categoría en el frontend (mismo patrón que `filas` para registros).
-    const mermasDetalleRows = (await env.DB.prepare(
-      `WITH normalizado AS (
-         SELECT id, ${FECHA_ISO_MERMA} AS fecha_iso, sku, producto, categoria, cantidad, costo_total, motivo, responsable
-         FROM mermas
-       )
-       SELECT id, fecha_iso, substr(fecha_iso,1,7) AS ym, sku, producto, categoria, cantidad, costo_total, motivo, responsable
-       FROM normalizado WHERE fecha_iso >= ? ORDER BY fecha_iso DESC`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
-    mermasFilas = mermasDetalleRows.map(r => ({
-      rowIndex: r.id, fecha: r.fecha_iso, ym: r.ym, sku: r.sku, producto: r.producto,
-      categoria: r.categoria || 'SIN CATEGORÍA', cantidad: r.cantidad, monto: r.costo_total,
-      motivo: String(r.motivo || '').toLowerCase(), responsable: r.responsable || ''
-    }));
-  } catch (e) { /* tabla mermas aún no disponible */ }
+  await Promise.all([pMermas, pVentas, pFiados]);
   const pctRetiroSocios = Number(config.pct_retiro_socios) || 0;
   const pctInversion = Number(config.pct_inversion) || 0;
   const pctReserva = Number(config.pct_reserva) || 0;
 
-  // --- Mix SKU/m² y venta por SKU (misma base D1 que Pedidos Marín 376) ---
-  let skuActivos = 0, ventaTotalYm = {}, ventaPorCategoriaYm = {}, ventaPorProveedorYm = {}, ventaPorSectorYm = {}, margenPorSectorYm = {}, margenPorProveedorYm = {};
-  try {
-    const skuRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM productos").first();
-    skuActivos = (skuRow && skuRow.n) || 0;
-
-    const ventaTotalRows = (await env.DB.prepare(
-      `SELECT substr(fecha,1,7) AS ym, SUM(venta) AS venta FROM (
-         SELECT fecha, sku, venta FROM ventas_diarias
-         UNION ALL
-         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) WHERE fecha >= ? AND sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym`
-    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
-    ventaTotalRows.forEach(r => ventaTotalYm[r.ym] = r.venta);
-
-    const ventaCatRows = (await env.DB.prepare(
-      `SELECT substr(vdh.fecha,1,7) AS ym, p.categoria AS categoria, SUM(vdh.venta) AS venta
-       FROM (
-         SELECT fecha, sku, venta FROM ventas_diarias
-         UNION ALL
-         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) vdh JOIN productos p ON p.sku = vdh.sku
-       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.categoria`
-    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
-    ventaCatRows.forEach(r => {
-      if (!ventaPorCategoriaYm[r.ym]) ventaPorCategoriaYm[r.ym] = {};
-      ventaPorCategoriaYm[r.ym][r.categoria] = r.venta;
-    });
-
-    // Venta por proveedor REAL (productos.proveedor_id → proveedores.nombre) — reemplaza el
-    // cruce por coincidencia de texto que usábamos antes de que Pedidos Marín separara los campos.
-    const ventaProvRows = (await env.DB.prepare(
-      `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor, SUM(vdh.venta) AS venta
-       FROM (
-         SELECT fecha, sku, venta FROM ventas_diarias
-         UNION ALL
-         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) vdh
-       JOIN productos p ON p.sku = vdh.sku
-       JOIN proveedores pr ON pr.id = p.proveedor_id
-       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, pr.nombre`
-    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
-    ventaProvRows.forEach(r => {
-      if (!ventaPorProveedorYm[r.ym]) ventaPorProveedorYm[r.ym] = {};
-      ventaPorProveedorYm[r.ym][r.proveedor] = r.venta;
-    });
-
-    // Venta por sector (productos.sector) — informativo, no hay cruce de compras por sector
-    // porque las compras (cartola/SCQ) no quedan ligadas a un SKU específico.
-    const ventaSectorRows = (await env.DB.prepare(
-      `SELECT substr(vdh.fecha,1,7) AS ym, p.sector AS sector, SUM(vdh.venta) AS venta
-       FROM (
-         SELECT fecha, sku, venta FROM ventas_diarias
-         UNION ALL
-         SELECT fecha, sku, venta FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) vdh JOIN productos p ON p.sku = vdh.sku
-       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.sector`
-    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
-    ventaSectorRows.forEach(r => {
-      if (!ventaPorSectorYm[r.ym]) ventaPorSectorYm[r.ym] = {};
-      ventaPorSectorYm[r.ym][r.sector] = r.venta;
-    });
-
-    // Margen real por sector (metodología Marcos Amorín: participación × margen por sector,
-    // sumado da el margen global ponderado). Usa la utilidad real que ya calcula Loyverse
-    // por cada venta (venta - costo del producto en ese momento) — no una aproximación por
-    // compras del mes, sino el costo real de lo efectivamente vendido.
-    const margenSectorRows = (await env.DB.prepare(
-      `SELECT substr(vdh.fecha,1,7) AS ym, p.sector AS sector,
-              SUM(vdh.venta) AS venta, SUM(vdh.utilidad) AS utilidad
-       FROM (
-         SELECT fecha, sku, venta, utilidad FROM ventas_diarias
-         UNION ALL
-         SELECT fecha, sku, venta, utilidad FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) vdh JOIN productos p ON p.sku = vdh.sku
-       WHERE vdh.fecha >= ? AND p.sector IS NOT NULL AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, p.sector`
-    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
-    margenSectorRows.forEach(r => {
-      if (!margenPorSectorYm[r.ym]) margenPorSectorYm[r.ym] = {};
-      margenPorSectorYm[r.ym][r.sector] = { venta: r.venta, utilidad: r.utilidad };
-    });
-
-    // Margen real por proveedor (misma metodología Amorín que por sector, arriba): usa la
-    // utilidad real de Loyverse, no lo pagado en el mes — a diferencia de "Rotación por
-    // proveedor" (cash de la cartola), esto es inmune a compras grandes puntuales o meses sin
-    // cartola cargada para ese proveedor.
-    const margenProveedorRows = (await env.DB.prepare(
-      `SELECT substr(vdh.fecha,1,7) AS ym, pr.nombre AS proveedor,
-              SUM(vdh.venta) AS venta, SUM(vdh.utilidad) AS utilidad
-       FROM (
-         SELECT fecha, sku, venta, utilidad FROM ventas_diarias
-         UNION ALL
-         SELECT fecha, sku, venta, utilidad FROM ventas_diarias_historico WHERE fecha < date('now','-90 days')
-       ) vdh
-       JOIN productos p ON p.sku = vdh.sku
-       JOIN proveedores pr ON pr.id = p.proveedor_id
-       WHERE vdh.fecha >= ? AND vdh.sku NOT IN (${FILTRO_SKU_NO_VENTA}) GROUP BY ym, pr.nombre`
-    ).bind(FECHA_INICIO_FINANZAS, ...SKUS_NO_VENTA).all()).results;
-    margenProveedorRows.forEach(r => {
-      if (!margenPorProveedorYm[r.ym]) margenPorProveedorYm[r.ym] = {};
-      margenPorProveedorYm[r.ym][r.proveedor] = { venta: r.venta, utilidad: r.utilidad };
-    });
-  } catch (e) { /* si productos/ventas_diarias_historico aún no existen, seguimos sin esto */ }
-
-  // --- Fiados: venta a crédito (método de pago "otros" en Loyverse) y sus abonos ---
-  // Las llena Pedidos Marín 376 (marin376-api), que ya tiene el módulo completo: `fiados` es
-  // cada venta fiada (con SKUs reales, ya contada en ventas_diarias/"Ventas registradas" de
-  // arriba — no es venta aparte, solo no se cobró); `pagos_fiado` es cada abono/cobro real,
-  // con método de pago y cliente. El SKU_ABONO_FIADO ("Abono Fiado" en ventas_diarias, ya
-  // excluido arriba) es solo el mecanismo con que ese sistema cuadra la caja en Loyverse — esta
-  // tabla es la fuente estructurada real para el monto de abonos, más precisa que inferirlo del
-  // SKU ficticio.
-  let fiadoGeneradoYm = {}, abonosFiadoYm = {};
-  try {
-    const fiadoGeneradoRows = (await env.DB.prepare(
-      `SELECT substr(fecha_hora,1,7) AS ym, SUM(monto_total) AS total
-       FROM fiados WHERE fecha_hora >= ? GROUP BY ym`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
-    fiadoGeneradoRows.forEach(r => fiadoGeneradoYm[r.ym] = r.total || 0);
-
-    const abonosFiadoRows = (await env.DB.prepare(
-      `SELECT substr(fecha_hora,1,7) AS ym, SUM(monto) AS total
-       FROM pagos_fiado WHERE fecha_hora >= ? GROUP BY ym`
-    ).bind(FECHA_INICIO_FINANZAS).all()).results;
-    abonosFiadoRows.forEach(r => abonosFiadoYm[r.ym] = r.total || 0);
-  } catch (e) { /* tablas de fiados aún no disponibles */ }
-
-  const quiebreValorizado = await calcularQuiebreValorizado(env);
-  const categoriasSinRotacion = await calcularCategoriasSinRotacion(env);
+  const quiebreValorizado = await pQuiebre;
+  const categoriasSinRotacion = await pSinRotacion;
   const vencimientosProximos = await calcularVencimientosProximos(env);
 
   const salida = {
