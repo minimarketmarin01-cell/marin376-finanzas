@@ -625,9 +625,15 @@ async function financieroAgregarFila(env, body) {
 
   // Si viene de aprobar un movimiento de Por revisar, aprende el patrón para
   // clasificar solo la próxima vez (igual que hacía Apps Script).
+  let aprendido = false;
   if (v.categoria && v.tipo && v.aprenderPatron !== false) {
     const clave = v.patron || v.nombre;
-    if (clave) {
+    // Las transferencias a cuentas de la familia/dueños ("TEF BANCOESTADO A SALAZAR REQUEJO E")
+    // sirven para cualquier cosa (almuerzo, celulares, Claude, sueldo...). Si se aprendiera su
+    // descripción, el próximo cargo con ese texto se clasificaría solo y mal. Se aprueba la fila
+    // igual, pero sin crear la regla.
+    if (clave && !esPatronGenericoDeFamilia(clave)) {
+      aprendido = true;
       await env.DB.prepare(
         `INSERT INTO diccionario_aprendido (patron, tipo, categoria, nombre) VALUES (?,?,?,?)
          ON CONFLICT(patron) DO UPDATE SET tipo=excluded.tipo, categoria=excluded.categoria, nombre=excluded.nombre`
@@ -635,7 +641,14 @@ async function financieroAgregarFila(env, body) {
     }
   }
   if (v.tipo === 'PAGO DEUDA') await sincronizarAbonosDeudaRossy(env);
-  return { ok: true };
+  return { ok: true, aprendido };
+}
+
+// Descripciones del banco que apuntan a una cuenta de la familia o de los socios: no se aprenden.
+const PATRONES_NO_APRENDER = ['SALAZAR REQUEJO', 'REQUEJO CALDERON', 'SALAZAR MONDRAGON'];
+function esPatronGenericoDeFamilia(clave) {
+  const u = String(clave || '').toUpperCase();
+  return PATRONES_NO_APRENDER.some(p => u.indexOf(p) !== -1);
 }
 
 async function financieroQuitarRevisar(env, body) {
