@@ -625,9 +625,15 @@ async function financieroAgregarFila(env, body) {
 
   // Si viene de aprobar un movimiento de Por revisar, aprende el patrón para
   // clasificar solo la próxima vez (igual que hacía Apps Script).
+  let aprendido = false;
   if (v.categoria && v.tipo && v.aprenderPatron !== false) {
     const clave = v.patron || v.nombre;
-    if (clave) {
+    // Las transferencias a cuentas de la familia/dueños ("TEF BANCOESTADO A SALAZAR REQUEJO E")
+    // sirven para cualquier cosa (almuerzo, celulares, Claude, sueldo...). Si se aprendiera su
+    // descripción, el próximo cargo con ese texto se clasificaría solo y mal. Se aprueba la fila
+    // igual, pero sin crear la regla.
+    if (clave && !esPatronGenericoDeFamilia(clave)) {
+      aprendido = true;
       await env.DB.prepare(
         `INSERT INTO diccionario_aprendido (patron, tipo, categoria, nombre) VALUES (?,?,?,?)
          ON CONFLICT(patron) DO UPDATE SET tipo=excluded.tipo, categoria=excluded.categoria, nombre=excluded.nombre`
@@ -635,7 +641,37 @@ async function financieroAgregarFila(env, body) {
     }
   }
   if (v.tipo === 'PAGO DEUDA') await sincronizarAbonosDeudaRossy(env);
-  return { ok: true };
+  return { ok: true, aprendido };
+}
+
+// Descripciones del banco que apuntan a una cuenta de la familia o de los socios: no se aprenden.
+const PATRONES_NO_APRENDER = ['SALAZAR REQUEJO', 'REQUEJO CALDERON', 'SALAZAR MONDRAGON'];
+function esPatronGenericoDeFamilia(clave) {
+  const u = String(clave || '').toUpperCase();
+  return PATRONES_NO_APRENDER.some(p => u.indexOf(p) !== -1);
+}
+
+// Crea un proveedor nuevo desde el panel (tarjeta de Revisar o Registros). Va a la misma tabla
+// `proveedores` que usa Pedidos, así que aparece allá y en todas las listas sin hacer nada más.
+// Si ya existe uno que se escribe igual sin contar mayúsculas, tildes ni signos, no crea otro:
+// devuelve el existente (así "SAN JORGE" y "San Jorge." no se parten en dos).
+async function financieroCrearProveedor(env, body) {
+  const nombre = String(body.nombre || '').toUpperCase().replace(/\s+/g, ' ').trim();
+  if (nombre.length < 2) return { ok: false, error: 'Escribe el nombre del proveedor' };
+  if (nombre.length > 60) return { ok: false, error: 'El nombre es muy largo (máximo 60 letras)' };
+  const mapa = await cargarMapaProveedoresReales(env);
+  const existente = mapa[normNombreProveedor(nombre)];
+  if (existente) return { ok: true, creado: false, nombre: existente };
+  try {
+    await env.DB.prepare("INSERT INTO proveedores (nombre) VALUES (?)").bind(nombre).run();
+  } catch (e) {
+    // Otro dispositivo lo creó justo antes (nombre es UNIQUE): se usa el que quedó.
+    const otra = await cargarMapaProveedoresReales(env);
+    const ya = otra[normNombreProveedor(nombre)];
+    if (ya) return { ok: true, creado: false, nombre: ya };
+    throw e;
+  }
+  return { ok: true, creado: true, nombre };
 }
 
 async function financieroQuitarRevisar(env, body) {
@@ -1658,6 +1694,9 @@ const _servidor = {
             break;
           case "financiero_agregar_fila":
             result = await financieroAgregarFila(env, body);
+            break;
+          case "financiero_crear_proveedor":
+            result = await financieroCrearProveedor(env, body);
             break;
           case "financiero_quitar_revisar":
             result = await financieroQuitarRevisar(env, body);
