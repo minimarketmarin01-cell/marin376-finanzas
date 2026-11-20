@@ -711,6 +711,35 @@ async function leerFotoConWorkersAI(env, prompt, imagenBase64, mediaType) {
   return { error: errores.join(' | ') || 'Sin modelos de visión configurados' };
 }
 
+// Lector con Gemini (Google AI Studio, capa gratuita): reemplaza a Workers AI al dejar Cloudflare. La clave va en el
+// secreto GEMINI_API_KEY de Supabase (Edge Functions → Secrets). MODELO_GEMINI permite cambiar el modelo sin tocar código.
+const MODELOS_GEMINI = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+async function leerFotoConGemini(env, prompt, imagenBase64, mediaType) {
+  const key = env.GEMINI_API_KEY;
+  if (!key) return { error: 'Falta el secreto GEMINI_API_KEY (Supabase → Edge Functions → Secrets)' };
+  const modelos = env.MODELO_GEMINI ? String(env.MODELO_GEMINI).split(',').map(x => x.trim()).filter(Boolean) : MODELOS_GEMINI;
+  const errores = [];
+  for (const modelo of modelos) {
+    try {
+      const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + modelo + ':generateContent', {
+        method: 'POST',
+        headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mediaType || 'image/jpeg', data: imagenBase64 } }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 4096, responseMimeType: 'application/json' }
+        })
+      });
+      const j = await resp.json().catch(() => ({}));
+      if (!resp.ok) { errores.push(modelo + ': HTTP ' + resp.status + ' ' + String((j.error && j.error.message) || '').slice(0, 160)); continue; }
+      const partes = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+      const texto = partes.map(x => x.text || '').join('');
+      if (texto.trim()) return { texto, modelo };
+      errores.push(modelo + ': respuesta vacía');
+    } catch (e) { errores.push(modelo + ': ' + String((e && e.message) || e).slice(0, 160)); }
+  }
+  return { error: errores.join(' | ') };
+}
+
 async function leerFotoConClaude(env, prompt, imagenBase64, mediaType) {
   const apiKey = env.CLAUDE_API_KEY || env.ANTHROPIC_API_KEY;
   if (!apiKey) return { error: 'Falta el secreto CLAUDE_API_KEY en el Worker (Settings → Variables and Secrets)' };
@@ -792,10 +821,10 @@ async function financieroLeerCierre(env, body) {
     'Los montos en Chile usan punto como separador de miles (ej: 45.000 = 45000). ' +
     'Si un número es ilegible, ponlo en 0 y no inventes. Devuelve solo el JSON.';
 
-  const lector = String(env.LECTOR_FOTO || (env.AI ? 'workers-ai' : 'claude')).toLowerCase();
-  if (lector !== 'claude' && !env.AI) return { ok: false, error: 'Falta el binding AI (Workers AI) en el Worker' };
-  const lectura = lector === 'claude'
-    ? await leerFotoConClaude(env, prompt, body.imagenBase64, body.mediaType)
+  const lector = String(env.LECTOR_FOTO || (env.GEMINI_API_KEY ? 'gemini' : env.AI ? 'workers-ai' : 'claude')).toLowerCase();
+  if (lector === 'workers-ai' && !env.AI) return { ok: false, error: 'Falta el binding AI (Workers AI) en el Worker' };
+  const lectura = lector === 'claude' ? await leerFotoConClaude(env, prompt, body.imagenBase64, body.mediaType)
+    : lector === 'gemini' ? await leerFotoConGemini(env, prompt, body.imagenBase64, body.mediaType)
     : await leerFotoConWorkersAI(env, prompt, body.imagenBase64, body.mediaType);
   if (lectura.error) return { ok: false, error: lectura.error };
 
