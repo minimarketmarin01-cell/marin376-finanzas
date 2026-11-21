@@ -14,7 +14,7 @@ const IDENT_MIXTOS = ["provId", "provLabel", "sinCosto"];
 export const TABLAS_CON_ID = new Set([
   "fiados", "fiados_lineas", "pagos_fiado", "movimientos_stock", "vencimientos", "mermas",
   "auditoria", "llegadas", "logs", "ventas_diarias", "proveedores", "sectores", "prestamos",
-  "push_subscriptions", "calculos_precio"
+  "push_subscriptions", "calculos_precio", "payments" /* deuda_rossy */
 ]);
 
 // UPDATE OR IGNORE: SQLite se salta las filas que chocarían con una clave única. Postgres no tiene equivalente directo:
