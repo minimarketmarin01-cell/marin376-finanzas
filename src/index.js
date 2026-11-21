@@ -1753,6 +1753,12 @@ const _servidor = {
 // Mide las descargas pesadas (solo GET: ahí está el panel financiero) en la D1 del local elegido; no demora la respuesta.
 export default {
   async fetch(request, env, ctx) {
+    // El panel financiero ya corre en Supabase (Edge Function finanzas-api). Este Worker solo reenvía lo que le llega
+    // (celulares con la versión vieja del panel). Emergencia: variable SIN_PROXY = "1" en el Worker.
+    if (!env.__plataforma && String(env.SIN_PROXY || "") !== "1") {
+      const u = new URL(request.url);
+      return fetch(new Request("https://znywepjclzhgkctzrjxb.supabase.co/functions/v1/finanzas-api" + (u.pathname === "/" ? "/" : u.pathname) + u.search, request));
+    }
     // Mudanza: copia la clave de este Worker al Vault de Supabase (una vez; ver exportar_secretos.js).
     if (!env.__plataforma && ctx && ctx.waitUntil) ctx.waitUntil(exportarSecretos(env, "finanzas", ["CLAUDE_API_KEY"]));
     const res = await _servidor.fetch(request, env, ctx);
