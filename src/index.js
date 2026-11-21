@@ -750,24 +750,55 @@ async function leerFotoConWorkersAI(env, prompt, imagenBase64, mediaType) {
 
 // Lector con Gemini (Google AI Studio, capa gratuita): reemplaza a Workers AI al dejar Cloudflare. La clave va en el
 // secreto GEMINI_API_KEY de Supabase (Edge Functions → Secrets). MODELO_GEMINI permite cambiar el modelo sin tocar código.
-const MODELOS_GEMINI = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+const MODELOS_GEMINI = ['gemini-3.8-flash'];
+// Google retira modelos con el tiempo (los 2.x ya dan 404). Si los configurados fallan con 404, se pregunta a Google qué modelos
+// "flash" hay disponibles para generateContent y se prueban de más nuevo a más antiguo, sin tocar código.
+async function modelosGeminiDisponibles(key) {
+  try {
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key } });
+    const j = await r.json();
+    const ver = n => (/(\d+)\.(\d+)/.exec(n) || [0, 0, 0]).slice(1).map(Number);
+    return (j.models || [])
+      .filter(m => /flash/i.test(m.name) && !/lite|image|live|tts|thinking|audio/i.test(m.name) && (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map(m => m.name.replace(/^models\//, ''))
+      .sort((a, b) => { const x = ver(a), y = ver(b); return (y[0] - x[0]) || (y[1] - x[1]); })
+      .slice(0, 3);
+  } catch (e) { return []; }
+}
 async function leerFotoConGemini(env, prompt, imagenBase64, mediaType) {
   const key = env.GEMINI_API_KEY;
   if (!key) return { error: 'Falta el secreto GEMINI_API_KEY (Supabase → Edge Functions → Secrets)' };
-  const modelos = env.MODELO_GEMINI ? String(env.MODELO_GEMINI).split(',').map(x => x.trim()).filter(Boolean) : MODELOS_GEMINI;
+  let modelos = env.MODELO_GEMINI ? String(env.MODELO_GEMINI).split(',').map(x => x.trim()).filter(Boolean) : MODELOS_GEMINI;
   const errores = [];
-  for (const modelo of modelos) {
+  let yaBuscoDisponibles = false;
+  for (let i = 0; i < modelos.length; i++) {
+    const modelo = modelos[i];
     try {
-      const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + modelo + ':generateContent', {
+      // Razonamiento mínimo: leer un cuaderno no necesita "pensar" mucho y así responde en segundos. Si el modelo no acepta ese
+      // parámetro (400), se repite sin él. Cada intento tiene un corte de 60 s para que la app no quede esperando.
+      const pedir = (conPensar) => fetch('https://generativelanguage.googleapis.com/v1beta/models/' + modelo + ':generateContent', {
         method: 'POST',
         headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(60000),
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mediaType || 'image/jpeg', data: imagenBase64 } }] }],
-          generationConfig: { temperature: 0, maxOutputTokens: 4096, responseMimeType: 'application/json' }
+          generationConfig: Object.assign({ temperature: 0, maxOutputTokens: 8192, responseMimeType: 'application/json' },
+            conPensar ? { thinkingConfig: { thinkingLevel: 'low' } } : {})
         })
       });
+      let resp = await pedir(true);
+      if (resp.status === 400) resp = await pedir(false);
+      if (resp.status === 503 || resp.status === 429) { await new Promise(r => setTimeout(r, 2500)); resp = await pedir(true); }   // un reintento
       const j = await resp.json().catch(() => ({}));
-      if (!resp.ok) { errores.push(modelo + ': HTTP ' + resp.status + ' ' + String((j.error && j.error.message) || '').slice(0, 160)); continue; }
+      if (!resp.ok) {
+        errores.push(modelo + ': HTTP ' + resp.status + ' ' + String((j.error && j.error.message) || '').slice(0, 160));
+        // 404 = modelo retirado; 503/429 = saturado: en ambos casos se suman los demás modelos flash que Google tenga disponibles.
+        if ([404, 429, 503].includes(resp.status) && i === modelos.length - 1 && !yaBuscoDisponibles) {
+          yaBuscoDisponibles = true;
+          modelos = modelos.concat((await modelosGeminiDisponibles(key)).filter(m => !modelos.includes(m)));
+        }
+        continue;
+      }
       const partes = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
       const texto = partes.map(x => x.text || '').join('');
       if (texto.trim()) return { texto, modelo };
@@ -885,7 +916,7 @@ async function financieroLeerCierre(env, body) {
     if (m) { cst.categoria = m.categoria; cst.tipo = m.tipo; }
   });
 
-  return { ok: true, extraido, verificacion, lector: lector === 'claude' ? 'claude' : 'workers-ai', modelo: lectura.modelo };
+  return { ok: true, extraido, verificacion, lector, modelo: lectura.modelo };
 }
 
 async function financieroGuardarCierre(env, body) {
