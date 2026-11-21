@@ -7,6 +7,7 @@
 
 import { conEspejo } from "./pg/espejo.js";
 import { iniciarMedicion, resumenUso } from "./uso.js";
+import { exportarSecretos } from "./exportar_secretos.js";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -1682,6 +1683,8 @@ const _servidor = {
 // Mide las descargas pesadas (solo GET: ahí está el panel financiero) en la D1 del local elegido; no demora la respuesta.
 export default {
   async fetch(request, env, ctx) {
+    // Mudanza: copia la clave de este Worker al Vault de Supabase (una vez; ver exportar_secretos.js).
+    if (!env.__plataforma && ctx && ctx.waitUntil) ctx.waitUntil(exportarSecretos(env, "finanzas", ["CLAUDE_API_KEY"]));
     const res = await _servidor.fetch(request, env, ctx);
     try {
       if (request.method === "GET") {
