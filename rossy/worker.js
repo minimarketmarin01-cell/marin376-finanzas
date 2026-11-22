@@ -435,6 +435,7 @@ var json = /* @__PURE__ */ __name((data, init) => new Response(JSON.stringify(da
 var badRequest = /* @__PURE__ */ __name((msg) => json({ error: msg }, { status: 400 }), "badRequest");
 var notFound = /* @__PURE__ */ __name(() => json({ error: "No encontrado" }, { status: 404 }), "notFound");
 var DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+var TIPOS_PAGO = /* @__PURE__ */ new Set(["transferencia", "efectivo", "otro"]);
 function slugify(name) {
   return name.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "grupo";
 }
@@ -444,7 +445,7 @@ async function getState(db) {
     db.prepare("SELECT key, value FROM settings").all(),
     db.prepare("SELECT id, label, from_date, to_date, monto, fuente FROM salary_tramos ORDER BY sort_order").all(),
     db.prepare("SELECT id, name, status, checked, description FROM categories ORDER BY sort_order").all(),
-    db.prepare("SELECT id, category_id, fecha, monto, nota FROM payments ORDER BY fecha").all()
+    db.prepare("SELECT id, category_id, fecha, monto, nota, tipo FROM payments ORDER BY fecha").all()
   ]);
   const settings = {};
   for (const row of settingsRes.results) settings[row.key] = row.value;
@@ -523,12 +524,14 @@ var index_default = {
         const body = await request.json();
         const { category_id, fecha, nota } = body;
         const monto = Number(body.monto);
+        const tipo = body.tipo || "transferencia";
         if (!category_id) return badRequest("category_id requerido");
         if (!DATE_RE.test(fecha || "")) return badRequest("fecha invalida (usa YYYY-MM-DD)");
         if (!Number.isFinite(monto) || monto <= 0) return badRequest("monto invalido");
+        if (!TIPOS_PAGO.has(tipo)) return badRequest("tipo invalido (usa transferencia, efectivo u otro)");
         const cat = await db.prepare("SELECT id FROM categories WHERE id = ?1").bind(category_id).first();
         if (!cat) return badRequest("categoria desconocida");
-        const res = await db.prepare("INSERT INTO payments (category_id, fecha, monto, nota) VALUES (?1, ?2, ?3, ?4)").bind(category_id, fecha, monto, nota || null).run();
+        const res = await db.prepare("INSERT INTO payments (category_id, fecha, monto, nota, tipo) VALUES (?1, ?2, ?3, ?4, ?5)").bind(category_id, fecha, monto, nota || null, tipo).run();
         return json({ ok: true, id: res.meta.last_row_id }, { status: 201 });
       }
       m = pathname.match(/^\/api\/payments\/(\d+)$/);
