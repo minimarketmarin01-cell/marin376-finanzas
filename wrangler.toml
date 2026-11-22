@@ -1,3 +1,6 @@
+# OBSOLETO desde el 21-22 nov 2026: el panel corre en Supabase (Edge Function finanzas-api).
+# Este Worker solo REENVÍA a Supabase. Las bases D1 de abajo están congeladas y desactualizadas:
+# no usarlas como fuente. Ver README.md.
 name = "marin376-finanzas"
 main = "src/index.js"
 compatibility_date = "2026-07-21"
@@ -17,6 +20,6 @@ binding = "DB_DEUDA_ROSSY"
 database_name = "deuda_sueldo_rossy"
 database_id = "03b54ed8-ac3a-4bc0-aae6-379b881ab68e"
 
-# Workers AI: lectura gratuita de la foto del cierre de caja
+# (en desuso) Workers AI: el lector de la foto ahora usa Gemini en Supabase
 [ai]
 binding = "AI"
