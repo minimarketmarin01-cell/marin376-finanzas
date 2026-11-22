@@ -275,7 +275,7 @@ async function sincronizarAbonosDeudaRossy(env) {
   if (!cfgLocal(env).espejoDeudaRossy || !env.DB_DEUDA_ROSSY) return 0;
   try {
     const abonos = (await env.DB.prepare(
-      "SELECT fecha, monto, nombre FROM registros WHERE tipo = 'PAGO DEUDA' AND UPPER(TRIM(categoria)) = 'SUELDO DEUDA' AND fecha >= ? ORDER BY fecha, id"
+      "SELECT fecha, monto, nombre, cuenta FROM registros WHERE tipo = 'PAGO DEUDA' AND UPPER(TRIM(categoria)) = 'SUELDO DEUDA' AND fecha >= ? ORDER BY fecha, id"
     ).bind(cfgLocal(env).fechaInicio).all()).results;
     if (!abonos.length) return 0;
     const yaEstan = (await env.DB_DEUDA_ROSSY.prepare(
@@ -289,9 +289,11 @@ async function sincronizarAbonosDeudaRossy(env) {
       if (cuenta[k] > 0) cuenta[k]--; else nuevos.push(a);
     }
     if (!nuevos.length) return 0;
+    // Tipo de pago que muestra la app de Rossy: lo que salió del banco es "transferencia"; el
+    // resto (cierre de caja, EFECTIVO) es "efectivo".
     await env.DB_DEUDA_ROSSY.batch(nuevos.map(a => env.DB_DEUDA_ROSSY.prepare(
-      "INSERT INTO payments (category_id, fecha, monto, nota) VALUES ('app_gastos_sep2026', ?, ?, ?)"
-    ).bind(a.fecha, Number(a.monto), a.nombre || 'Rossy')));
+      "INSERT INTO payments (category_id, fecha, monto, nota, tipo) VALUES ('app_gastos_sep2026', ?, ?, ?, ?)"
+    ).bind(a.fecha, Number(a.monto), a.nombre || 'Rossy', String(a.cuenta || '').trim().toUpperCase() === 'BANCO' ? 'transferencia' : 'efectivo')));
     return nuevos.length;
   } catch (e) { return 0; }
 }
