@@ -154,7 +154,8 @@ const DICCIONARIO_FINANZAS = [
   ['NEMARICH',                   'COSTOS', 'NEMARICH',           'Nemarich'],
   ['AJUSTE CARGO INTERNET',      'GASTO OPE', 'INTERNET',        'Internet'],
   ['PAGO UNIRED',                'GASTO OPE', 'SERVICIOS BÁSICOS','Agua Unired'],
-  ['KHIPU',                      'GASTO OPE', 'COMUNICACIONES',  'Celulares'],
+  // KHIPU (pasarela de pagos) ya no se clasifica solo: por ahí se pagan celulares, gastos comunes
+  // del departamento de Portugal y otros. Sin regla, va a Por revisar y se clasifica a mano.
   ['CONDOMINIO GEOCENTRO',       'GASTO OPE', 'GASTOS COMUNES',  'Gastos Comunes'],
   ['QUINCALLERIA',               'GASTO OPE', 'MATERIALES DE MANTENIMIENTO', 'Quincalleria'],
   ['FERRETERIA D',               'GASTO OPE', 'MATERIALES DE MANTENIMIENTO', 'Ferreteria'],
